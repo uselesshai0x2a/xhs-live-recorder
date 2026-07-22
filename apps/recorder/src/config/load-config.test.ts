@@ -20,7 +20,7 @@ afterEach(async () => {
 describe("loadConfig", () => {
   it("loads the platform-neutral target format", async () => {
     const directory = await writeConfig({
-      polling: { interval_ms: 30_000 },
+      polling: { interval_ms: 30_000, request_interval_ms: 5_000 },
       targets: [
         {
           id: "xhs:alice",
@@ -34,6 +34,7 @@ describe("loadConfig", () => {
     const config = await loadConfig(directory);
 
     expect(config.pollIntervalMs).toBe(30_000);
+    expect(config.requestIntervalMs).toBe(5_000);
     expect(config.targets).toEqual([
       {
         id: "xhs:alice",

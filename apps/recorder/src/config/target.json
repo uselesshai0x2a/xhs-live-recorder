@@ -1,8 +1,17 @@
 {
   "polling": {
-    "interval_ms": 60000
+    "interval_ms": 60000,
+    "request_interval_ms": 5000
   },
   "targets": [
+    {
+      "id": "xhs:JUN31570",
+      "platform": "xhs",
+      "name": "沈阳导游小君",
+      "params": {
+        "key_word": "JUN31570"
+      }
+    },
     {
       "id": "xhs:9412892896",
       "platform": "xhs",
@@ -10,14 +19,6 @@
       "params": {
         "key_word": "9412892896"
       }
-    },
-    {
-        "id": "xhs:JUN31570",
-        "platform": "xhs",
-        "name": "test",
-        "params": {
-          "key_word": "JUN31570"
-        }
-      }
+    }
   ]
 }

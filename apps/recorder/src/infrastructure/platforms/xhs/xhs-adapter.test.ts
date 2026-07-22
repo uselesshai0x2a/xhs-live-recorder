@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { TargetDefinition } from "../../../domain/live";
-import { XhsAdapter } from "./xhs-adapter";
+import { generateXhsLiveStreamAddress, XhsAdapter } from "./xhs-adapter";
 
 const auth = {
   headers: {
@@ -65,7 +65,31 @@ describe("XhsAdapter", () => {
     }
     await expect(
       adapter.resolveLiveAddress(result.session, new AbortController().signal),
-    ).resolves.toEqual({ status: "unavailable", reason: "not_implemented" });
+    ).resolves.toEqual({
+      status: "resolved",
+      address: "https://live-source-play-hw.xhscdn.com/live/room-1_hcv520.flv",
+    });
+  });
+
+  it("generates the confirmed XHS FLV stream address from room_id", () => {
+    expect(generateXhsLiveStreamAddress("570374211240727213")).toBe(
+      "https://live-source-play-hw.xhscdn.com/live/570374211240727213_hcv520.flv",
+    );
+  });
+
+  it("does not resolve a stream address without room_id", async () => {
+    const adapter = adapterWithPayload({});
+
+    await expect(
+      adapter.resolveLiveAddress(
+        {
+          platform: "xhs",
+          targetId: "xhs:alice",
+          metadata: {},
+        },
+        new AbortController().signal,
+      ),
+    ).resolves.toEqual({ status: "unavailable", reason: "missing_room_id" });
   });
 
   it("returns unknown instead of offline when live_info is missing", async () => {
@@ -80,6 +104,28 @@ describe("XhsAdapter", () => {
       state: "unknown",
       reason: "live_info is missing from the XHS response",
     });
+  });
+
+  it("extracts the observed target name from user_one_box.title", async () => {
+    const adapter = adapterWithPayload({
+      data: {
+        onebox_list: [
+          {
+            user_one_box: {
+              title: "Observed Name",
+              live_info: { status: 0 },
+            },
+          },
+        ],
+      },
+    });
+
+    await expect(
+      adapter.checkLiveStatus(
+        adapter.validateTarget(target),
+        new AbortController().signal,
+      ),
+    ).resolves.toEqual({ state: "offline", observedName: "Observed Name" });
   });
 
   it("reuses search_id and creates a new request_id for each request", async () => {

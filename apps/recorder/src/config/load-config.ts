@@ -3,9 +3,11 @@ import path from "node:path";
 import type { TargetDefinition } from "../domain/live";
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
+const DEFAULT_REQUEST_INTERVAL_MS = 5_000;
 
 export interface RecorderConfig {
   readonly pollIntervalMs: number;
+  readonly requestIntervalMs: number;
   readonly targets: readonly TargetDefinition[];
   readonly platformAuth: Readonly<Record<string, unknown>>;
 }
@@ -29,9 +31,28 @@ export async function loadConfig(configDir?: string): Promise<RecorderConfig> {
 
   return {
     pollIntervalMs: parsePollInterval(targetInput),
+    requestIntervalMs: parseRequestInterval(targetInput),
     targets: parseTargets(targetInput),
     platformAuth: parsePlatformAuth(authInput),
   };
+}
+
+function parseRequestInterval(input: unknown): number {
+  const root = requireRecord(input, "target.json root");
+  if (root.polling === undefined) {
+    return DEFAULT_REQUEST_INTERVAL_MS;
+  }
+  const polling = requireRecord(root.polling, "polling");
+  if (polling.request_interval_ms === undefined) {
+    return DEFAULT_REQUEST_INTERVAL_MS;
+  }
+  const interval = polling.request_interval_ms;
+  if (!Number.isInteger(interval) || (interval as number) < 0) {
+    throw new ConfigError(
+      "polling.request_interval_ms must be a non-negative integer",
+    );
+  }
+  return interval as number;
 }
 
 async function readJson(filePath: string): Promise<unknown> {

@@ -22,9 +22,17 @@ export interface LiveSession {
 }
 
 export type LiveCheckResult =
-  | { readonly state: "offline" }
-  | { readonly state: "unknown"; readonly reason: string }
-  | { readonly state: "live"; readonly session: LiveSession };
+  | { readonly state: "offline"; readonly observedName?: string }
+  | {
+      readonly state: "unknown";
+      readonly reason: string;
+      readonly observedName?: string;
+    }
+  | {
+      readonly state: "live";
+      readonly session: LiveSession;
+      readonly observedName?: string;
+    };
 
 export type LiveAddressResolution =
   | { readonly status: "resolved"; readonly address: string }

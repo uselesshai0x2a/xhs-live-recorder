@@ -16,6 +16,11 @@ export class LiveDiscoveryService {
     const platformTarget = adapter.validateTarget(target);
     const checkResult = await adapter.checkLiveStatus(platformTarget, signal);
     const checkedAt = new Date();
+    const observedTarget =
+      checkResult.observedName === undefined ||
+      checkResult.observedName === target.name
+        ? target
+        : { ...target, name: checkResult.observedName };
 
     if (checkResult.state === "live") {
       const addressResolution = await adapter.resolveLiveAddress(
@@ -23,7 +28,7 @@ export class LiveDiscoveryService {
         signal,
       );
       return {
-        target,
+        target: observedTarget,
         state: "live",
         session: checkResult.session,
         addressResolution,
@@ -33,7 +38,7 @@ export class LiveDiscoveryService {
     }
     if (checkResult.state === "unknown") {
       return {
-        target,
+        target: observedTarget,
         state: "unknown",
         session: null,
         addressResolution: null,
@@ -42,7 +47,7 @@ export class LiveDiscoveryService {
       };
     }
     return {
-      target,
+      target: observedTarget,
       state: "offline",
       session: null,
       addressResolution: null,

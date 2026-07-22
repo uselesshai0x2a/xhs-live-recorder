@@ -12,6 +12,8 @@ import type { LivePlatformAdapter } from "../../../ports/platform-adapter";
 const XHS_PLATFORM = "xhs";
 const XHS_ONEBOX_URL =
   "https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox";
+const XHS_LIVE_STREAM_BASE_URL = "https://live-source-play-hw.xhscdn.com/live";
+const XHS_LIVE_STREAM_SUFFIX = "_hcv520.flv";
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -146,20 +148,29 @@ export class XhsAdapter implements LivePlatformAdapter {
       );
     }
 
-    const liveInfo = findLiveInfo(payload);
+    const userBox = findUserOneBox(payload);
+    const observedName = optionalString(userBox?.title);
+    const liveInfo = isRecord(userBox?.live_info)
+      ? userBox.live_info
+      : findLiveInfo(payload);
     if (liveInfo === null) {
       return {
         state: "unknown",
         reason: "live_info is missing from the XHS response",
+        ...(observedName === undefined ? {} : { observedName }),
       };
     }
     if (liveInfo.status === 0) {
-      return { state: "offline" };
+      return {
+        state: "offline",
+        ...(observedName === undefined ? {} : { observedName }),
+      };
     }
     if (liveInfo.status !== 2) {
       return {
         state: "unknown",
         reason: `Unsupported XHS live_info.status: ${String(liveInfo.status)}`,
+        ...(observedName === undefined ? {} : { observedName }),
       };
     }
 
@@ -168,6 +179,7 @@ export class XhsAdapter implements LivePlatformAdapter {
     const sourceLink = optionalString(liveInfo.link);
     return {
       state: "live",
+      ...(observedName === undefined ? {} : { observedName }),
       session: {
         platform: this.platform,
         targetId: target.definition.id,
@@ -180,12 +192,18 @@ export class XhsAdapter implements LivePlatformAdapter {
   }
 
   resolveLiveAddress(
-    _session: LiveSession,
+    session: LiveSession,
     _signal: AbortSignal,
   ): Promise<LiveAddressResolution> {
+    if (session.roomId === undefined || session.roomId.trim() === "") {
+      return Promise.resolve({
+        status: "unavailable",
+        reason: "missing_room_id",
+      });
+    }
     return Promise.resolve({
-      status: "unavailable",
-      reason: "not_implemented",
+      status: "resolved",
+      address: generateXhsLiveStreamAddress(session.roomId),
     });
   }
 
@@ -200,6 +218,30 @@ export class XhsAdapter implements LivePlatformAdapter {
         : { "x-s-common": this.#headers.xSCommon }),
     };
   }
+}
+
+function findUserOneBox(payload: unknown): Record<string, unknown> | null {
+  if (!isRecord(payload) || !isRecord(payload.data)) {
+    return null;
+  }
+  const list = payload.data.onebox_list;
+  if (!Array.isArray(list)) {
+    return null;
+  }
+  for (const item of list) {
+    if (isRecord(item) && isRecord(item.user_one_box)) {
+      return item.user_one_box;
+    }
+  }
+  return null;
+}
+
+export function generateXhsLiveStreamAddress(roomId: string): string {
+  const normalizedRoomId = roomId.trim();
+  if (normalizedRoomId === "") {
+    throw new Error("XHS room_id must be a non-empty string");
+  }
+  return `${XHS_LIVE_STREAM_BASE_URL}/${encodeURIComponent(normalizedRoomId)}${XHS_LIVE_STREAM_SUFFIX}`;
 }
 
 function parseAuth(input: unknown): XhsHeaders {

@@ -4,6 +4,7 @@ import { LiveDiscoveryService } from "./application/live-discovery-service";
 import { LiveMonitorService } from "./application/live-monitor-service";
 import { PollingService } from "./application/polling-service";
 import { ConfigError, loadConfig } from "./config/load-config";
+import { JsonTargetMetadataStore } from "./infrastructure/config/json-target-metadata-store";
 import { XhsAdapter } from "./infrastructure/platforms/xhs/xhs-adapter";
 import { ConsoleLiveEventSink } from "./infrastructure/sinks/console/console-live-event-sink";
 import { PlatformAdapterRegistry } from "./ports/platform-adapter";
@@ -17,7 +18,10 @@ export async function main(
   args: readonly string[] = process.argv.slice(2),
 ): Promise<void> {
   const options = parseCliOptions(args);
-  const config = await loadConfig(process.env.LIVE_RECORDER_CONFIG_DIR);
+  const configDirectory =
+    process.env.LIVE_RECORDER_CONFIG_DIR ??
+    path.resolve(process.cwd(), "src/config");
+  const config = await loadConfig(configDirectory);
   const xhsAuth = config.platformAuth.xhs;
   if (xhsAuth === undefined) {
     throw new ConfigError(
@@ -41,6 +45,8 @@ export async function main(
       config.targets,
       discovery,
       new ConsoleLiveEventSink(),
+      new JsonTargetMetadataStore(path.join(configDirectory, "target.json")),
+      config.requestIntervalMs,
     );
     if (options.targetId !== undefined) {
       await monitor.checkTarget(options.targetId, abortController.signal);

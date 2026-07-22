@@ -13,6 +13,7 @@ import {
   type LivePlatformAdapter,
   PlatformAdapterRegistry,
 } from "../ports/platform-adapter";
+import type { TargetMetadataStore } from "../ports/target-metadata-store";
 import { LiveDiscoveryService } from "./live-discovery-service";
 import { LiveMonitorService } from "./live-monitor-service";
 
@@ -115,6 +116,50 @@ describe("LiveMonitorService", () => {
     expect(limited.checkCalls).toBe(1);
     expect(healthy.checkCalls).toBe(0);
   });
+
+  it("waits between requests but not before the first request", async () => {
+    const first = new FakeAdapter("first", [offline()]);
+    const second = new FakeAdapter("second", [offline()]);
+    const sink = new MemorySink();
+    const delays: number[] = [];
+    const monitor = new LiveMonitorService(
+      [target("one", "first"), target("two", "second")],
+      new LiveDiscoveryService(new PlatformAdapterRegistry([first, second])),
+      sink,
+      undefined,
+      5_000,
+      (milliseconds) => {
+        delays.push(milliseconds);
+        return Promise.resolve();
+      },
+    );
+
+    await monitor.runPollingCycle(new AbortController().signal);
+
+    expect(delays).toEqual([5_000]);
+    expect(first.checkCalls).toBe(1);
+    expect(second.checkCalls).toBe(1);
+  });
+
+  it("updates observed target names without coupling the monitor to a platform", async () => {
+    const adapter = new FakeAdapter("fake", [offline("Updated Name")]);
+    const sink = new MemorySink();
+    const metadataStore = new MemoryTargetMetadataStore();
+    const monitor = new LiveMonitorService(
+      [target("one", "fake")],
+      new LiveDiscoveryService(new PlatformAdapterRegistry([adapter])),
+      sink,
+      metadataStore,
+    );
+
+    await monitor.runPollingCycle(new AbortController().signal);
+
+    expect(metadataStore.updates).toEqual([
+      { targetId: "one", name: "Updated Name" },
+    ]);
+    expect(monitor.targets[0]?.name).toBe("Updated Name");
+    expect(sink.events[0]?.target.name).toBe("Updated Name");
+  });
 });
 
 class FakeAdapter implements LivePlatformAdapter {
@@ -163,6 +208,15 @@ class MemorySink implements LiveEventSink {
   }
 }
 
+class MemoryTargetMetadataStore implements TargetMetadataStore {
+  readonly updates: Array<{ targetId: string; name: string }> = [];
+
+  updateName(targetId: string, name: string): Promise<void> {
+    this.updates.push({ targetId, name });
+    return Promise.resolve();
+  }
+}
+
 function createMonitor(
   targets: readonly TargetDefinition[],
   adapters: readonly LivePlatformAdapter[],
@@ -181,8 +235,11 @@ function target(id: string, platform: string): TargetDefinition {
   return { id, platform, name: id, params: {} };
 }
 
-function offline(): LiveCheckResult {
-  return { state: "offline" };
+function offline(observedName?: string): LiveCheckResult {
+  return {
+    state: "offline",
+    ...(observedName === undefined ? {} : { observedName }),
+  };
 }
 
 function live(): LiveCheckResult {

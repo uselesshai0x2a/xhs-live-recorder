@@ -6,6 +6,8 @@ import {
   type TargetDefinition,
 } from "../domain/live";
 import type { LiveEventSink } from "../ports/live-event-sink";
+import type { TargetMetadataStore } from "../ports/target-metadata-store";
+import { abortableDelay } from "./abortable-delay";
 import type { LiveDiscoveryService } from "./live-discovery-service";
 
 interface TargetState {
@@ -16,14 +18,21 @@ interface TargetState {
 export class LiveMonitorService {
   readonly #targetStates = new Map<string, TargetState>();
   readonly #disabledPlatforms = new Set<string>();
+  readonly targets: TargetDefinition[];
 
   constructor(
-    readonly targets: readonly TargetDefinition[],
+    targets: readonly TargetDefinition[],
     private readonly discovery: LiveDiscoveryService,
     private readonly sink: LiveEventSink,
-  ) {}
+    private readonly metadataStore?: TargetMetadataStore,
+    private readonly requestIntervalMs = 0,
+    private readonly delay: typeof abortableDelay = abortableDelay,
+  ) {
+    this.targets = [...targets];
+  }
 
   async runPollingCycle(signal: AbortSignal): Promise<void> {
+    let hasMadeRequest = false;
     for (const target of this.targets) {
       if (signal.aborted) {
         return;
@@ -31,6 +40,13 @@ export class LiveMonitorService {
       if (this.#disabledPlatforms.has(target.platform)) {
         continue;
       }
+      if (hasMadeRequest) {
+        await this.delay(this.requestIntervalMs, signal);
+        if (signal.aborted) {
+          return;
+        }
+      }
+      hasMadeRequest = true;
       const outcome = await this.#checkForPolling(target, signal);
       if (outcome === "stop-cycle") {
         return;
@@ -57,15 +73,20 @@ export class LiveMonitorService {
 
     try {
       const result = await this.discovery.checkTarget(target, signal);
+      await this.#synchronizeName(target, result);
       if (result.state === "unknown") {
         await this.#deliverError(
-          target,
+          result.target,
           "UNKNOWN_RESPONSE",
           result.reason ?? "Unknown response",
         );
         return result;
       }
-      await this.sink.deliver({ kind: "manual", target, result });
+      await this.sink.deliver({
+        kind: "manual",
+        target: result.target,
+        result,
+      });
       return result;
     } catch (error) {
       if (signal.aborted) {
@@ -82,13 +103,14 @@ export class LiveMonitorService {
   ): Promise<"continue" | "stop-cycle"> {
     try {
       const result = await this.discovery.checkTarget(target, signal);
+      await this.#synchronizeName(target, result);
       if (result.state === "unknown") {
         this.#targetStates.set(target.id, {
           ...this.#targetStates.get(target.id),
           hadError: true,
         });
         await this.#deliverError(
-          target,
+          result.target,
           "UNKNOWN_RESPONSE",
           result.reason ?? "Unknown response",
         );
@@ -121,19 +143,43 @@ export class LiveMonitorService {
     this.#targetStates.set(target.id, { state: nextState, hadError: false });
 
     if (previous?.state === undefined) {
-      await this.sink.deliver({ kind: "initial", target, result });
+      await this.sink.deliver({
+        kind: "initial",
+        target: result.target,
+        result,
+      });
       return;
     }
     if (previous.state !== nextState) {
       await this.sink.deliver({
         kind: nextState === "live" ? "started" : "stopped",
-        target,
+        target: result.target,
         result,
       });
       return;
     }
     if (previous.hadError) {
-      await this.sink.deliver({ kind: "recovered", target, result });
+      await this.sink.deliver({
+        kind: "recovered",
+        target: result.target,
+        result,
+      });
+    }
+  }
+
+  async #synchronizeName(
+    originalTarget: TargetDefinition,
+    result: LiveDiscoveryResult,
+  ): Promise<void> {
+    if (result.target.name === originalTarget.name) {
+      return;
+    }
+    await this.metadataStore?.updateName(originalTarget.id, result.target.name);
+    const index = this.targets.findIndex(
+      (target) => target.id === originalTarget.id,
+    );
+    if (index >= 0) {
+      this.targets[index] = result.target;
     }
   }
 
