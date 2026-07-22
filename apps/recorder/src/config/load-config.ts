@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { TargetDefinition } from "../domain/live";
+import type { RecordingConfig } from "../domain/recording";
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 const DEFAULT_REQUEST_INTERVAL_MS = 5_000;
@@ -10,6 +11,7 @@ export interface RecorderConfig {
   readonly requestIntervalMs: number;
   readonly targets: readonly TargetDefinition[];
   readonly platformAuth: Readonly<Record<string, unknown>>;
+  readonly recording: RecordingConfig;
 }
 
 export class ConfigError extends Error {
@@ -24,9 +26,10 @@ export class ConfigError extends Error {
 
 export async function loadConfig(configDir?: string): Promise<RecorderConfig> {
   const directory = configDir ?? path.resolve(process.cwd(), "src/config");
-  const [targetInput, authInput] = await Promise.all([
+  const [targetInput, authInput, recordingInput] = await Promise.all([
     readJson(path.join(directory, "target.json")),
     readJson(path.join(directory, "auth.json")),
+    readOptionalJson(path.join(directory, "recording.json"), {}),
   ]);
 
   return {
@@ -34,7 +37,110 @@ export async function loadConfig(configDir?: string): Promise<RecorderConfig> {
     requestIntervalMs: parseRequestInterval(targetInput),
     targets: parseTargets(targetInput),
     platformAuth: parsePlatformAuth(authInput),
+    recording: parseRecordingConfig(recordingInput),
   };
+}
+
+async function readOptionalJson(
+  filePath: string,
+  fallback: unknown,
+): Promise<unknown> {
+  try {
+    return await readJson(filePath);
+  } catch (error) {
+    if (
+      error instanceof ConfigError &&
+      error.cause instanceof Error &&
+      "code" in error.cause &&
+      error.cause.code === "ENOENT"
+    ) {
+      return fallback;
+    }
+    throw error;
+  }
+}
+
+function parseRecordingConfig(input: unknown): RecordingConfig {
+  const root = requireRecord(input, "recording.json root");
+  const segmentation =
+    root.segmentation === undefined
+      ? {}
+      : requireRecord(root.segmentation, "recording.segmentation");
+  const outputDirectory =
+    root.output_dir === undefined
+      ? "recordings"
+      : requireNonEmptyString(root.output_dir, "recording.output_dir");
+  const bitrate = root.video_bitrate ?? "source";
+  if (typeof bitrate !== "string" || bitrate.trim() === "") {
+    throw new ConfigError("recording.video_bitrate must be a non-empty string");
+  }
+  const retryDelays = root.retry_delays_ms ?? [5_000, 15_000, 30_000];
+  if (
+    !Array.isArray(retryDelays) ||
+    !retryDelays.every((value) => Number.isInteger(value) && value >= 0)
+  ) {
+    throw new ConfigError(
+      "recording.retry_delays_ms must be an array of non-negative integers",
+    );
+  }
+
+  return {
+    enabled: parseBoolean(root.enabled, true, "recording.enabled"),
+    outputDirectory,
+    segmentation: {
+      enabled: parseBoolean(
+        segmentation.enabled,
+        true,
+        "recording.segmentation.enabled",
+      ),
+      durationSeconds: parsePositiveInteger(
+        segmentation.duration_seconds,
+        1_800,
+        "recording.segmentation.duration_seconds",
+      ),
+      autoMerge: parseBoolean(
+        segmentation.auto_merge,
+        true,
+        "recording.segmentation.auto_merge",
+      ),
+      keepSegments: parseBoolean(
+        segmentation.keep_segments,
+        false,
+        "recording.segmentation.keep_segments",
+      ),
+    },
+    videoBitrate: bitrate.trim() === "source" ? "source" : bitrate.trim(),
+    retryDelaysMs: retryDelays as number[],
+    gracefulStopTimeoutMs: parsePositiveInteger(
+      root.graceful_stop_timeout_ms,
+      10_000,
+      "recording.graceful_stop_timeout_ms",
+    ),
+  };
+}
+
+function parseBoolean(
+  value: unknown,
+  fallback: boolean,
+  label: string,
+): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") {
+    throw new ConfigError(`${label} must be a boolean`);
+  }
+  return value;
+}
+
+function parsePositiveInteger(
+  value: unknown,
+  fallback: number,
+  label: string,
+): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    throw new ConfigError(`${label} must be a positive integer`);
+  }
+  return value as number;
 }
 
 function parseRequestInterval(input: unknown): number {

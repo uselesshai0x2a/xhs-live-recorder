@@ -13,7 +13,7 @@ const XHS_PLATFORM = "xhs";
 const XHS_ONEBOX_URL =
   "https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox";
 const XHS_LIVE_STREAM_BASE_URL = "https://live-source-play-hw.xhscdn.com/live";
-const XHS_LIVE_STREAM_SUFFIX = "_hcv520.flv";
+const XHS_LIVE_STREAM_SUFFIX = ".flv";
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -186,6 +186,15 @@ export class XhsAdapter implements LivePlatformAdapter {
         ...(roomId === undefined ? {} : { roomId }),
         ...(xsecToken === undefined ? {} : { xsecToken }),
         ...(sourceLink === undefined ? {} : { sourceLink }),
+        ...(roomId === undefined
+          ? {}
+          : {
+              recordingIdentity: {
+                platform: this.platform,
+                targetKey: keyWord,
+                roomKey: roomId,
+              },
+            }),
         metadata: { liveInfo },
       },
     };

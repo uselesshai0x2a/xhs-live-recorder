@@ -58,6 +58,11 @@ describe("XhsAdapter", () => {
         roomId: "room-1",
         xsecToken: "xsec-1",
         sourceLink: "https://example.test/source",
+        recordingIdentity: {
+          platform: "xhs",
+          targetKey: "alice",
+          roomKey: "room-1",
+        },
       },
     });
     if (result.state !== "live") {
@@ -67,13 +72,13 @@ describe("XhsAdapter", () => {
       adapter.resolveLiveAddress(result.session, new AbortController().signal),
     ).resolves.toEqual({
       status: "resolved",
-      address: "https://live-source-play-hw.xhscdn.com/live/room-1_hcv520.flv",
+      address: "https://live-source-play-hw.xhscdn.com/live/room-1.flv",
     });
   });
 
   it("generates the confirmed XHS FLV stream address from room_id", () => {
     expect(generateXhsLiveStreamAddress("570374211240727213")).toBe(
-      "https://live-source-play-hw.xhscdn.com/live/570374211240727213_hcv520.flv",
+      "https://live-source-play-hw.xhscdn.com/live/570374211240727213.flv",
     );
   });
 

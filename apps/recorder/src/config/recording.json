@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "output_dir": "recordings",
+  "segmentation": {
+    "enabled": true,
+    "duration_seconds": 1800,
+    "auto_merge": true,
+    "keep_segments": false
+  },
+  "video_bitrate": "source",
+  "retry_delays_ms": [5000, 15000, 30000],
+  "graceful_stop_timeout_ms": 10000
+}

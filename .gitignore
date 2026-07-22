@@ -13,6 +13,7 @@ data/
 
 *.log
 coverage/
+recordings/
 
 # Local authentication secrets
 apps/recorder/src/config/auth.json

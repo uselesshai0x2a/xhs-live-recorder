@@ -6,6 +6,7 @@ allowBuilds:
   electron: true
   electron-winstaller: true
   esbuild: true
+  ffmpeg-static: true
 minimumReleaseAgeExclude:
   - '@biomejs/biome@2.5.5'
   - '@biomejs/cli-darwin-arm64@2.5.5'

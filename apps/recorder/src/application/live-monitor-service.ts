@@ -164,7 +164,13 @@ export class LiveMonitorService {
         target: result.target,
         result,
       });
+      return;
     }
+    await this.sink.deliver({
+      kind: "checked",
+      target: result.target,
+      result,
+    });
   }
 
   async #synchronizeName(

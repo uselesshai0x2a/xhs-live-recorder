@@ -18,7 +18,7 @@ import { LiveDiscoveryService } from "./live-discovery-service";
 import { LiveMonitorService } from "./live-monitor-service";
 
 describe("LiveMonitorService", () => {
-  it("delivers initial and changed states but suppresses duplicates", async () => {
+  it("delivers a checked event when a clear state is unchanged", async () => {
     const adapter = new FakeAdapter("fake", [
       offline(),
       offline(),
@@ -35,6 +35,7 @@ describe("LiveMonitorService", () => {
 
     expect(sink.events.map((event) => event.kind)).toEqual([
       "initial",
+      "checked",
       "started",
       "stopped",
     ]);
@@ -82,6 +83,7 @@ describe("LiveMonitorService", () => {
     expect(sink.events.map((event) => event.kind)).toEqual([
       "error",
       "initial",
+      "checked",
     ]);
   });
 

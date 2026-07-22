@@ -1,15 +1,15 @@
 {
   "polling": {
-    "interval_ms": 60000,
+    "interval_ms": 30000,
     "request_interval_ms": 5000
   },
   "targets": [
     {
-      "id": "xhs:JUN31570",
+      "id": "xhs:6866618356",
       "platform": "xhs",
-      "name": "沈阳导游小君",
+      "name": "轩潮",
       "params": {
-        "key_word": "JUN31570"
+        "key_word": "6866618356"
       }
     },
     {

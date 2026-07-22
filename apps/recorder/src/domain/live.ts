@@ -12,12 +12,19 @@ export interface PlatformTarget {
   readonly data: unknown;
 }
 
+export interface RecordingSessionIdentity {
+  readonly platform: string;
+  readonly targetKey: string;
+  readonly roomKey: string;
+}
+
 export interface LiveSession {
   readonly platform: string;
   readonly targetId: string;
   readonly roomId?: string;
   readonly xsecToken?: string;
   readonly sourceLink?: string;
+  readonly recordingIdentity?: RecordingSessionIdentity;
   readonly metadata: Readonly<Record<string, unknown>>;
 }
 
@@ -84,7 +91,13 @@ export class LiveDiscoveryError extends Error {
 
 export type LiveEvent =
   | {
-      readonly kind: "initial" | "started" | "stopped" | "recovered" | "manual";
+      readonly kind:
+        | "initial"
+        | "checked"
+        | "started"
+        | "stopped"
+        | "recovered"
+        | "manual";
       readonly target: TargetDefinition;
       readonly result: LiveDiscoveryResult;
     }

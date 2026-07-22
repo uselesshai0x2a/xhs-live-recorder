@@ -44,6 +44,13 @@ describe("loadConfig", () => {
       },
     ]);
     expect(config.platformAuth).toHaveProperty("xhs");
+    expect(config.recording).toMatchObject({
+      enabled: true,
+      outputDirectory: "recordings",
+      videoBitrate: "source",
+      retryDelaysMs: [5_000, 15_000, 30_000],
+      segmentation: { durationSeconds: 1_800, autoMerge: true },
+    });
   });
 
   it("rejects duplicate stable target ids", async () => {
@@ -66,6 +73,20 @@ describe("loadConfig", () => {
 
     await expect(loadConfig(directory)).rejects.toThrow(
       "target.json targets must be a non-empty array",
+    );
+  });
+
+  it("validates recording-specific configuration", async () => {
+    const directory = await writeConfig({
+      targets: [{ id: "one", platform: "xhs", params: {} }],
+    });
+    await writeFile(
+      path.join(directory, "recording.json"),
+      JSON.stringify({ retry_delays_ms: [5_000, -1] }),
+    );
+
+    await expect(loadConfig(directory)).rejects.toThrow(
+      "recording.retry_delays_ms must be an array of non-negative integers",
     );
   });
 });
