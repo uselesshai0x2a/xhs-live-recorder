@@ -1,0 +1,23 @@
+{
+  "polling": {
+    "interval_ms": 60000
+  },
+  "targets": [
+    {
+      "id": "xhs:9412892896",
+      "platform": "xhs",
+      "name": "少年霜",
+      "params": {
+        "key_word": "9412892896"
+      }
+    },
+    {
+        "id": "xhs:JUN31570",
+        "platform": "xhs",
+        "name": "test",
+        "params": {
+          "key_word": "JUN31570"
+        }
+      }
+  ]
+}

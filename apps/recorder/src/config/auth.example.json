@@ -1,0 +1,9 @@
+{
+  "xhs": {
+    "headers": {
+      "x-s": "replace-with-x-s",
+      "x-s-common": "",
+      "cookie": "replace-with-cookie"
+    }
+  }
+}

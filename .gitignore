@@ -1,0 +1,18 @@
+node_modules/
+dist/
+out/
+
+.env
+.env.*
+!.env.example
+
+data/
+*.db
+*.db-shm
+*.db-wal
+
+*.log
+coverage/
+
+# Local authentication secrets
+apps/recorder/src/config/auth.json

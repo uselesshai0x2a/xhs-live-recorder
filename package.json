@@ -1,0 +1,42 @@
+{
+  "name": "xhs-live-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.15.1",
+  "engines": {
+    "node": "26.x",
+    "pnpm": "11.x"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "26.4.0",
+      "onFail": "download"
+    },
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.15.1",
+      "onFail": "download"
+    }
+  },
+  "scripts": {
+    "dev": "pnpm --filter @xhs-live-recorder/recorder dev",
+    "start": "pnpm --filter @xhs-live-recorder/recorder start",
+    "build": "pnpm --filter @xhs-live-recorder/recorder build",
+    "typecheck": "pnpm --filter @xhs-live-recorder/recorder typecheck",
+    "test": "pnpm --filter @xhs-live-recorder/recorder test",
+    "check": "biome check apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts",
+    "format": "biome format --write apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts",
+    "dev:all": "pnpm -r --parallel --if-present run dev",
+    "build:all": "pnpm -r --if-present run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.5",
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.10"
+  }
+}
