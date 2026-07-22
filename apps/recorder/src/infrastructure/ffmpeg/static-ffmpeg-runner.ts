@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import ffmpegPath from "ffmpeg-static";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { isSea } from "node:sea";
 import type {
   FfmpegExit,
   FfmpegRunner,
@@ -12,7 +14,9 @@ export interface FfmpegBinaryProvider {
 }
 
 export class StaticFfmpegBinaryProvider implements FfmpegBinaryProvider {
-  constructor(private readonly injectedPath: string | null = ffmpegPath) {}
+  constructor(
+    private readonly injectedPath: string | null = resolveProjectFfmpegPath(),
+  ) {}
 
   getPath(): string {
     if (this.injectedPath === null || this.injectedPath.trim() === "") {
@@ -27,6 +31,29 @@ export class StaticFfmpegBinaryProvider implements FfmpegBinaryProvider {
       );
     }
     return this.injectedPath;
+  }
+}
+
+function resolveProjectFfmpegPath(): string | null {
+  const configuredPath = process.env.LIVE_RECORDER_FFMPEG_PATH?.trim();
+  if (configuredPath !== undefined && configuredPath !== "") {
+    return path.resolve(configuredPath);
+  }
+  if (isSea()) {
+    return path.join(
+      path.dirname(process.execPath),
+      process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg",
+    );
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const moduleEntry = require.resolve("ffmpeg-static");
+    return path.join(
+      path.dirname(moduleEntry),
+      process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg",
+    );
+  } catch {
+    return null;
   }
 }
 

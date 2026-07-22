@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
 import { LiveDiscoveryService } from "./application/live-discovery-service";
 import { LiveMonitorService } from "./application/live-monitor-service";
@@ -27,9 +28,10 @@ export async function main(
   args: readonly string[] = process.argv.slice(2),
 ): Promise<void> {
   const options = parseCliOptions(args);
+  const runtimeDirectory = getRuntimeDirectory();
   const configDirectory =
     process.env.LIVE_RECORDER_CONFIG_DIR ??
-    path.resolve(process.cwd(), "src/config");
+    path.join(runtimeDirectory, isSea() ? "config" : "src/config");
   const config = await loadConfig(configDirectory);
   const xhsAuth = config.platformAuth.xhs;
   if (xhsAuth === undefined) {
@@ -137,13 +139,14 @@ function parseCliOptions(args: readonly string[]): CliOptions {
 const currentFile = fileURLToPath(import.meta.url);
 const entryFile =
   process.argv[1] === undefined ? "" : path.resolve(process.argv[1]);
-if (path.resolve(currentFile) === entryFile) {
+if (isSea() || path.resolve(currentFile) === entryFile) {
   void runCli();
 }
 
 async function runCli(): Promise<void> {
   let startupLog: StartupLog | undefined;
   try {
+    if (isSea()) process.chdir(getRuntimeDirectory());
     const logDirectory =
       process.env.LIVE_RECORDER_LOG_DIR ?? path.resolve(process.cwd(), "logs");
     startupLog = await StartupLog.start(logDirectory);
@@ -160,4 +163,8 @@ async function runCli(): Promise<void> {
   } finally {
     await startupLog?.close();
   }
+}
+
+function getRuntimeDirectory(): string {
+  return isSea() ? path.dirname(process.execPath) : process.cwd();
 }

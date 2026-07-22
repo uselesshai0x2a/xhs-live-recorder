@@ -24,10 +24,11 @@
     "dev": "pnpm --filter @xhs-live-recorder/recorder dev",
     "start": "pnpm --filter @xhs-live-recorder/recorder start",
     "build": "pnpm --filter @xhs-live-recorder/recorder build",
+    "package:win": "pnpm build && node scripts/package-windows.mjs",
     "typecheck": "pnpm --filter @xhs-live-recorder/recorder typecheck",
     "test": "pnpm --filter @xhs-live-recorder/recorder test",
-    "check": "biome check apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts",
-    "format": "biome format --write apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts",
+    "check": "biome check apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts scripts",
+    "format": "biome format --write apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts scripts",
     "dev:all": "pnpm -r --parallel --if-present run dev",
     "build:all": "pnpm -r --if-present run build"
   },
