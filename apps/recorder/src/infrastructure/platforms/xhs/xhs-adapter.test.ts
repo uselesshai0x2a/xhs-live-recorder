@@ -10,6 +10,9 @@ const auth = {
   },
 };
 
+const expectedUserAgent =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+
 const target: TargetDefinition = {
   id: "xhs:alice",
   platform: "xhs",
@@ -135,11 +138,13 @@ describe("XhsAdapter", () => {
 
   it("reuses search_id and creates a new request_id for each request", async () => {
     const bodies: Array<Record<string, unknown>> = [];
+    const requestHeaders: Headers[] = [];
     const fetchFn = async (
       _input: string | URL,
       init?: RequestInit,
     ): Promise<Response> => {
       bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      requestHeaders.push(new Headers(init?.headers));
       return jsonResponse({ data: { live_info: { status: 0 } } });
     };
     const adapter = new XhsAdapter(auth, {
@@ -162,6 +167,35 @@ describe("XhsAdapter", () => {
     ]);
     expect(bodies[0]?.request_id).toMatch(/^[0-9]{6}-1000$/);
     expect(bodies[1]?.request_id).toMatch(/^[0-9]{6}-2000$/);
+    for (const headers of requestHeaders) {
+      expect(headers.get("user-agent")).toBe(expectedUserAgent);
+      expect(headers.get("x-b3-traceid")).toBeNull();
+      expect(headers.get("cookie")).toBe("cookie-value");
+      expect(headers.get("x-s")).toBe("signature-value");
+      expect(headers.get("x-s-common")).toBe("common-value");
+    }
+  });
+
+  it("classifies an abnormal account state without returning offline", async () => {
+    const adapter = new XhsAdapter(auth, {
+      fetchFn: () =>
+        Promise.resolve(
+          jsonResponse({
+            success: false,
+            msg: "\u8d26\u53f7\u72b6\u6001\u5f02\u5e38",
+          }),
+        ),
+    });
+
+    await expect(
+      adapter.checkLiveStatus(
+        adapter.validateTarget(target),
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      kind: "ACCOUNT_RESTRICTED",
+      disablesPlatform: true,
+    });
   });
 
   it.each([

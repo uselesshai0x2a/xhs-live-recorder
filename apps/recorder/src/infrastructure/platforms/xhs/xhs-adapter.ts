@@ -12,6 +12,8 @@ import type { LivePlatformAdapter } from "../../../ports/platform-adapter";
 const XHS_PLATFORM = "xhs";
 const XHS_ONEBOX_URL =
   "https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox";
+const XHS_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 const XHS_LIVE_STREAM_BASE_URL = "https://live-source-play-hw.xhscdn.com/live";
 const XHS_LIVE_STREAM_SUFFIX = ".flv";
 
@@ -108,6 +110,14 @@ export class XhsAdapter implements LivePlatformAdapter {
     const payload = parsePayload(responseText, response.ok);
     const diagnostic = extractDiagnostic(payload, responseText);
 
+    if (looksLikeAccountRestriction(diagnostic)) {
+      throw new LiveDiscoveryError(
+        "ACCOUNT_RESTRICTED",
+        this.platform,
+        "XHS reported an abnormal account state or risk-control rejection",
+        { disablesPlatform: true },
+      );
+    }
     if (response.status === 401 || looksLikeAuthFailure(diagnostic)) {
       throw new LiveDiscoveryError(
         "AUTH_EXPIRED",
@@ -220,6 +230,7 @@ export class XhsAdapter implements LivePlatformAdapter {
     return {
       accept: "application/json, text/plain, */*",
       "content-type": "application/json;charset=UTF-8",
+      "user-agent": XHS_USER_AGENT,
       cookie: this.#headers.cookie,
       "x-s": this.#headers.xS,
       ...(this.#headers.xSCommon === undefined
@@ -304,6 +315,12 @@ function extractDiagnostic(payload: unknown, responseText: string): string {
 
 function looksLikeAuthFailure(message: string): boolean {
   return /(未登录|登录失效|登录过期|login required|not logged|cookie expired|session expired|authentication expired)/i.test(
+    message,
+  );
+}
+
+function looksLikeAccountRestriction(message: string): boolean {
+  return /(\u8d26\u53f7\u72b6\u6001\u5f02\u5e38|account status abnormal|abnormal account state|risk control)/i.test(
     message,
   );
 }

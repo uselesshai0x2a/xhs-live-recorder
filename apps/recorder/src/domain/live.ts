@@ -56,6 +56,7 @@ export interface LiveDiscoveryResult {
 
 export type LiveErrorKind =
   | "AUTH_EXPIRED"
+  | "ACCOUNT_RESTRICTED"
   | "SIGNATURE_INVALID"
   | "RATE_LIMITED"
   | "HTTP_ERROR"
