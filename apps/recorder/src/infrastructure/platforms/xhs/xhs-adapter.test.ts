@@ -201,6 +201,7 @@ describe("XhsAdapter", () => {
   it.each([
     [401, { message: "unauthorized" }, "AUTH_EXPIRED", true],
     [403, { message: "X-S signature invalid" }, "SIGNATURE_INVALID", true],
+    [406, { message: "not acceptable" }, "SIGNATURE_INVALID", true],
     [429, { message: "too many requests" }, "RATE_LIMITED", false],
     [500, { message: "server error" }, "HTTP_ERROR", false],
   ] as const)(
@@ -262,6 +263,113 @@ describe("XhsAdapter", () => {
         new AbortController().signal,
       ),
     ).rejects.toMatchObject({ kind: "NETWORK_ERROR" });
+  });
+
+  it("refreshes auth and retries once after an authentication failure", async () => {
+    const responses: Response[] = [
+      jsonResponse({ message: "login expired" }, 401),
+      jsonResponse({ data: { live_info: { status: 0 } } }),
+    ];
+    const usedHeaders: Headers[] = [];
+    const fetchFn = async (
+      _input: string | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      usedHeaders.push(new Headers(init?.headers));
+      const next = responses.shift();
+      if (next === undefined) {
+        throw new Error("Unexpected extra request");
+      }
+      return next;
+    };
+    const refreshed = {
+      cookie: "new-cookie",
+      xS: "new-x-s",
+      xSCommon: "new-common",
+    };
+    const refresh = vi.fn().mockResolvedValue(refreshed);
+    const onHeadersUpdated = vi.fn();
+    const adapter = new XhsAdapter(auth, {
+      fetchFn,
+      authRefresher: { refresh, close: vi.fn() },
+      onHeadersUpdated,
+    });
+
+    const result = await adapter.checkLiveStatus(
+      adapter.validateTarget(target),
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({ state: "offline" });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith({
+      cookie: "cookie-value",
+      xS: "signature-value",
+      xSCommon: "common-value",
+    });
+    expect(onHeadersUpdated).toHaveBeenCalledWith(refreshed);
+    expect(usedHeaders[0]?.get("cookie")).toBe("cookie-value");
+    expect(usedHeaders[1]?.get("cookie")).toBe("new-cookie");
+    expect(usedHeaders[1]?.get("x-s")).toBe("new-x-s");
+    expect(usedHeaders[1]?.get("x-s-common")).toBe("new-common");
+  });
+
+  it("disables the platform when the refresh itself fails", async () => {
+    const refresh = vi.fn().mockRejectedValue(new Error("no browser"));
+    const adapter = new XhsAdapter(auth, {
+      fetchFn: () =>
+        Promise.resolve(jsonResponse({ message: "login expired" }, 401)),
+      authRefresher: { refresh, close: vi.fn() },
+    });
+
+    await expect(
+      adapter.checkLiveStatus(
+        adapter.validateTarget(target),
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ kind: "AUTH_EXPIRED", disablesPlatform: true });
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes only once and disables the platform when the retry still fails", async () => {
+    const refresh = vi
+      .fn()
+      .mockResolvedValue({ cookie: "new-cookie", xS: "new-x-s" });
+    const adapter = new XhsAdapter(auth, {
+      fetchFn: () =>
+        Promise.resolve(jsonResponse({ message: "X-S invalid" }, 403)),
+      authRefresher: { refresh, close: vi.fn() },
+    });
+
+    await expect(
+      adapter.checkLiveStatus(
+        adapter.validateTarget(target),
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      kind: "SIGNATURE_INVALID",
+      disablesPlatform: true,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refresh account-restriction errors", async () => {
+    const refresh = vi.fn();
+    const adapter = new XhsAdapter(auth, {
+      fetchFn: () =>
+        Promise.resolve(
+          jsonResponse({ success: false, msg: "\u8d26\u53f7\u72b6\u6001\u5f02\u5e38" }),
+        ),
+      authRefresher: { refresh, close: vi.fn() },
+    });
+
+    await expect(
+      adapter.checkLiveStatus(
+        adapter.validateTarget(target),
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ kind: "ACCOUNT_RESTRICTED" });
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 

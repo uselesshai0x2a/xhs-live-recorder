@@ -8,6 +8,10 @@ import {
   type TargetDefinition,
 } from "../../../domain/live";
 import type { LivePlatformAdapter } from "../../../ports/platform-adapter";
+import type {
+  XhsAuthHeaders,
+  XhsAuthRefresher,
+} from "./xhs-auth-refresher";
 
 const XHS_PLATFORM = "xhs";
 const XHS_ONEBOX_URL =
@@ -23,30 +27,37 @@ interface XhsTargetParams {
   readonly keyWord: string;
 }
 
-interface XhsHeaders {
-  readonly cookie: string;
-  readonly xS: string;
-  readonly xSCommon?: string;
-}
-
 export interface XhsAdapterOptions {
   readonly fetchFn?: FetchLike;
   readonly searchId?: string;
   readonly timeoutMs?: number;
+  /** Browser-backed refresher used to recover expired cookies/signatures. */
+  readonly authRefresher?: XhsAuthRefresher;
+  /** Invoked after a successful refresh so callers can persist new headers. */
+  readonly onHeadersUpdated?: (headers: XhsAuthHeaders) => void | Promise<void>;
+  readonly logger?: (message: string) => void;
 }
 
 export class XhsAdapter implements LivePlatformAdapter {
   readonly platform = XHS_PLATFORM;
-  readonly #headers: XhsHeaders;
+  #headers: XhsAuthHeaders;
   readonly #fetch: FetchLike;
   readonly #searchId: string;
   readonly #timeoutMs: number;
+  readonly #refresher: XhsAuthRefresher | undefined;
+  readonly #onHeadersUpdated:
+    | ((headers: XhsAuthHeaders) => void | Promise<void>)
+    | undefined;
+  readonly #logger: (message: string) => void;
 
   constructor(auth: unknown, options: XhsAdapterOptions = {}) {
     this.#headers = parseAuth(auth);
     this.#fetch = options.fetchFn ?? fetch;
     this.#searchId = options.searchId ?? generateDigits(21);
     this.#timeoutMs = options.timeoutMs ?? 15_000;
+    this.#refresher = options.authRefresher;
+    this.#onHeadersUpdated = options.onHeadersUpdated;
+    this.#logger = options.logger ?? (() => {});
   }
 
   validateTarget(target: TargetDefinition): PlatformTarget {
@@ -62,6 +73,20 @@ export class XhsAdapter implements LivePlatformAdapter {
   }
 
   async checkLiveStatus(
+    target: PlatformTarget,
+    signal: AbortSignal,
+  ): Promise<LiveCheckResult> {
+    try {
+      return await this.#executeCheck(target, signal);
+    } catch (error) {
+      if (!signal.aborted && (await this.#tryRefreshAuth(error))) {
+        return await this.#executeCheck(target, signal);
+      }
+      throw error;
+    }
+  }
+
+  async #executeCheck(
     target: PlatformTarget,
     signal: AbortSignal,
   ): Promise<LiveCheckResult> {
@@ -141,6 +166,14 @@ export class XhsAdapter implements LivePlatformAdapter {
         "RATE_LIMITED",
         this.platform,
         "XHS rate limit reached",
+      );
+    }
+    if (response.status === 406) {
+      throw new LiveDiscoveryError(
+        "SIGNATURE_INVALID",
+        this.platform,
+        "XHS rejected the request with HTTP 406 (expired cookie or signature)",
+        { disablesPlatform: true },
       );
     }
     if (!response.ok) {
@@ -238,6 +271,51 @@ export class XhsAdapter implements LivePlatformAdapter {
         : { "x-s-common": this.#headers.xSCommon }),
     };
   }
+
+  async #tryRefreshAuth(error: unknown): Promise<boolean> {
+    if (this.#refresher === undefined || !isRefreshableAuthError(error)) {
+      return false;
+    }
+    this.#logger(
+      `XHS auth ${error.kind}; attempting a browser-backed refresh`,
+    );
+    let refreshed: XhsAuthHeaders;
+    try {
+      refreshed = await this.#refresher.refresh(this.#headers);
+    } catch (refreshError) {
+      this.#logger(
+        `XHS auth refresh failed: ${
+          refreshError instanceof Error
+            ? refreshError.message
+            : String(refreshError)
+        }`,
+      );
+      return false;
+    }
+    this.#headers = refreshed;
+    try {
+      await this.#onHeadersUpdated?.(refreshed);
+    } catch (persistError) {
+      this.#logger(
+        `XHS auth persisted in memory but could not be saved: ${
+          persistError instanceof Error
+            ? persistError.message
+            : String(persistError)
+        }`,
+      );
+    }
+    this.#logger("XHS auth refreshed; retrying the request once");
+    return true;
+  }
+}
+
+function isRefreshableAuthError(
+  error: unknown,
+): error is LiveDiscoveryError & { kind: "AUTH_EXPIRED" | "SIGNATURE_INVALID" } {
+  return (
+    error instanceof LiveDiscoveryError &&
+    (error.kind === "AUTH_EXPIRED" || error.kind === "SIGNATURE_INVALID")
+  );
 }
 
 function findUserOneBox(payload: unknown): Record<string, unknown> | null {
@@ -264,7 +342,7 @@ export function generateXhsLiveStreamAddress(roomId: string): string {
   return `${XHS_LIVE_STREAM_BASE_URL}/${encodeURIComponent(normalizedRoomId)}${XHS_LIVE_STREAM_SUFFIX}`;
 }
 
-function parseAuth(input: unknown): XhsHeaders {
+function parseAuth(input: unknown): XhsAuthHeaders {
   const auth = requireRecord(input, "auth.xhs");
   const headers = requireRecord(auth.headers, "auth.xhs.headers");
   const xSCommon = optionalString(headers["x-s-common"]);
