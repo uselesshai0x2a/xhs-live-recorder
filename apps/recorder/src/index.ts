@@ -8,12 +8,14 @@ import { RecordingCoordinator } from "./application/recording-coordinator";
 import { RecordingManager } from "./application/recording-manager";
 import { ConfigError, loadConfig } from "./config/load-config";
 import { JsonTargetMetadataStore } from "./infrastructure/config/json-target-metadata-store";
+import { JsonXhsAuthStore } from "./infrastructure/config/json-xhs-auth-store";
 import {
   StaticFfmpegBinaryProvider,
   StaticFfmpegRunner,
 } from "./infrastructure/ffmpeg/static-ffmpeg-runner";
 import { StartupLog } from "./infrastructure/logging/startup-log";
 import { XhsAdapter } from "./infrastructure/platforms/xhs/xhs-adapter";
+import { PuppeteerXhsAuthRefresher } from "./infrastructure/platforms/xhs/xhs-auth-refresher";
 import { CompositeLiveEventSink } from "./infrastructure/sinks/composite-live-event-sink";
 import { ConsoleLiveEventSink } from "./infrastructure/sinks/console/console-live-event-sink";
 import { ConsoleRecordingEventSink } from "./infrastructure/sinks/console/console-recording-event-sink";
@@ -40,7 +42,23 @@ export async function main(
     );
   }
 
-  const registry = new PlatformAdapterRegistry([new XhsAdapter(xhsAuth)]);
+  const authStore = new JsonXhsAuthStore(
+    path.join(configDirectory, "auth.json"),
+  );
+  const probeKeyword = resolveProbeKeyword(config.targets);
+  const authRefresher = new PuppeteerXhsAuthRefresher({
+    ...(probeKeyword === undefined ? {} : { probeKeyword }),
+    headless: process.env.XHS_BROWSER_HEADLESS === "1",
+    logger: (message) =>
+      console.log(`${new Date().toISOString()} ${message}`),
+  });
+  const xhsAdapter = new XhsAdapter(xhsAuth, {
+    authRefresher,
+    onHeadersUpdated: (headers) => authStore.save(headers),
+    logger: (message) =>
+      console.log(`${new Date().toISOString()} ${message}`),
+  });
+  const registry = new PlatformAdapterRegistry([xhsAdapter]);
   const discovery = new LiveDiscoveryService(registry);
   for (const target of config.targets) {
     discovery.validateTarget(target);
@@ -103,9 +121,28 @@ export async function main(
     await polling.run(abortController.signal);
   } finally {
     await recordingManager?.stopAll();
+    await authRefresher.close();
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }
+}
+
+function resolveProbeKeyword(
+  targets: readonly { readonly params: unknown }[],
+): string | undefined {
+  for (const target of targets) {
+    if (
+      target.params !== null &&
+      typeof target.params === "object" &&
+      "key_word" in target.params
+    ) {
+      const keyWord = (target.params as { key_word: unknown }).key_word;
+      if (typeof keyWord === "string" && keyWord.trim() !== "") {
+        return keyWord.trim();
+      }
+    }
+  }
+  return undefined;
 }
 
 function parseCliOptions(args: readonly string[]): CliOptions {
