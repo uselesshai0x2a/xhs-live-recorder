@@ -21,16 +21,18 @@
     }
   },
   "scripts": {
-    "dev": "pnpm --filter @xhs-live-recorder/recorder dev",
-    "start": "pnpm --filter @xhs-live-recorder/recorder start",
-    "build": "pnpm --filter @xhs-live-recorder/recorder build",
-    "package:win": "pnpm build && node scripts/package-windows.mjs",
-    "typecheck": "pnpm --filter @xhs-live-recorder/recorder typecheck",
-    "test": "pnpm --filter @xhs-live-recorder/recorder test",
-    "check": "biome check apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts scripts",
-    "format": "biome format --write apps/recorder/src apps/recorder/package.json apps/recorder/tsconfig.json apps/recorder/vite.config.ts scripts",
-    "dev:all": "pnpm -r --parallel --if-present run dev",
-    "build:all": "pnpm -r --if-present run build"
+    "browser:validate": "node scripts/validate-browser.mjs",
+    "test:browser": "vitest run apps/desktop/src/main/browser",
+    "dev": "node scripts/validate-browser.mjs",
+    "start": "pnpm --filter apps-desktop start",
+    "build": "pnpm --filter apps-desktop build",
+    "package:win": "pnpm --filter apps-desktop build:win",
+    "typecheck": "pnpm --filter @xhs-live-recorder/core typecheck && pnpm --filter apps-desktop typecheck",
+    "test": "vitest run && node scripts/test-native.mjs",
+    "check": "pnpm --filter apps-desktop lint && biome check packages/recorder-core/src scripts/validate-browser.mjs scripts/test-native.mjs",
+    "format": "pnpm --filter apps-desktop format && biome format --write packages/recorder-core/src scripts",
+    "dev:all": "pnpm dev",
+    "build:all": "pnpm build"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.5",

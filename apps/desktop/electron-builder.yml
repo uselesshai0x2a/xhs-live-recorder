@@ -1,45 +1,36 @@
-appId: com.electron.app
-productName: apps-desktop
+appId: com.xhs.live.recorder
+productName: XHS Live Recorder
 directories:
-  buildResources: build
+  output: ../../release/desktop
 files:
-  - '!**/.vscode/*'
-  - '!src/*'
-  - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
-  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
-asarUnpack:
+  - out/**
   - resources/**
+  - package.json
+  - '!out/**/*.map'
+  - '!out/**/*.log'
+  - '!node_modules/ffmpeg-static/ffmpeg.exe'
+  - '!node_modules/@xhs-live-recorder/core/**'
+asarUnpack:
+  - '**/*.node'
+extraResources:
+  - from: node_modules/ffmpeg-static/ffmpeg.exe
+    to: ffmpeg.exe
+  - from: node_modules/ffmpeg-static/LICENSE
+    to: FFmpeg-LICENSE.txt
 win:
-  executableName: apps-desktop
-nsis:
-  artifactName: ${name}-${version}-setup.${ext}
-  shortcutName: ${productName}
-  uninstallDisplayName: ${productName}
-  createDesktopShortcut: always
-mac:
-  entitlementsInherit: build/entitlements.mac.plist
-  extendInfo:
-    - NSCameraUsageDescription: Application requests access to the device's camera.
-    - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
-    - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
-    - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
-  notarize: false
-dmg:
-  artifactName: ${name}-${version}.${ext}
-linux:
+  executableName: xhs-live-recorder
   target:
-    - AppImage
-    - snap
-    - deb
-  maintainer: electronjs.org
-  category: Utility
-appImage:
-  artifactName: ${name}-${version}.${ext}
+    - target: nsis
+      arch: [x64]
+  signAndEditExecutable: false
+nsis:
+  artifactName: XHS-Live-Recorder-${version}-Windows-x64.${ext}
+  shortcutName: XHS Live Recorder
+  uninstallDisplayName: XHS Live Recorder
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  deleteAppDataOnUninstall: false
 npmRebuild: false
-publish:
-  provider: generic
-  url: https://example.com/auto-updates
-electronDownload:
-  mirror: https://npmmirror.com/mirrors/electron/
+electronDist: node_modules/electron/dist

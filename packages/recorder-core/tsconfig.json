@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,8 +1,8 @@
-import { ElectronAPI } from '@electron-toolkit/preload'
-
+import type { BrowserApi } from '../shared/browser'
+import type { AppApi } from '../shared/app'
 declare global {
   interface Window {
-    electron: ElectronAPI
-    api: unknown
+    recorder: AppApi
+    browser: BrowserApi
   }
 }

@@ -2,6 +2,8 @@ packages:
   - apps/*
   - packages/*
   - tooling/*
+overrides:
+  'app-builder-lib>@electron/get': '4.0.3'
 allowBuilds:
   electron: true
   electron-winstaller: true
