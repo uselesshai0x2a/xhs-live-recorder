@@ -2,12 +2,47 @@ export type LiveState = "live" | "offline" | "unknown";
 export type BlockReason = "manual" | "disk" | "output" | null;
 export type QueryErrorKind =
   | "AUTH"
+  | "VERIFICATION"
+  | "SIGNATURE"
+  | "SIGNER"
+  | "TIMEOUT"
+  | "SESSION_CHANGED"
   | "RESTRICTED"
   | "RATE_LIMITED"
   | "NETWORK"
   | "SCHEMA"
   | "MATCH"
   | "UNKNOWN";
+export type QueryBlockKind = Extract<
+  QueryErrorKind,
+  | "AUTH"
+  | "VERIFICATION"
+  | "RESTRICTED"
+  | "RATE_LIMITED"
+  | "SIGNATURE"
+  | "SIGNER"
+  | "SCHEMA"
+>;
+export type QueryRecoveryAction =
+  | "login"
+  | "verify"
+  | "retry"
+  | "repair"
+  | "wait"
+  | "details";
+export interface QueryIssue {
+  id: string;
+  kind: QueryErrorKind;
+  title: string;
+  message: string;
+  help: string;
+  action: QueryRecoveryAction;
+  occurredAt: string;
+  httpStatus?: number;
+  businessCode?: string | number;
+  diagnostic?: string;
+  retryAt?: string;
+}
 export interface Candidate {
   keyWord: string;
   userId: string | null;
@@ -29,6 +64,7 @@ export interface Target extends Candidate {
   archivedAt: string | null;
   generation: number;
   errorKind: QueryErrorKind | null;
+  queryError?: QueryIssue | null;
   lastConfirmedAt: string | null;
 }
 export interface Settings {
