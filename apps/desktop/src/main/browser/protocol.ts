@@ -1,4 +1,7 @@
 import type { BrowserCandidate } from '../../shared/browser'
+import type { QueryErrorKind } from '@xhs-live-recorder/core'
+import { BrowserQueryError } from '../../shared/query-error'
+export { BrowserQueryError } from '../../shared/query-error'
 
 export const ONEBOX_PATH = '/api/sns/web/v1/search/onebox'
 export function isVerificationPage(value: string): boolean {
@@ -9,20 +12,79 @@ export function isVerificationPage(value: string): boolean {
     return false
   }
 }
-export class BrowserQueryError extends Error {
-  constructor(
-    message: string,
-    readonly kind:
-      | 'AUTH'
-      | 'RESTRICTED'
-      | 'RATE_LIMITED'
-      | 'NETWORK'
-      | 'SCHEMA'
-      | 'MATCH'
-      | 'UNKNOWN' = 'NETWORK'
-  ) {
-    super(message)
+export function responseError(
+  status: number,
+  payload: unknown,
+  retryAfter?: string | null,
+  now = Date.now(),
+  secrets: string[] = []
+): BrowserQueryError | null {
+  const body = isRecord(payload) ? payload : {}
+  if (
+    status >= 200 &&
+    status < 300 &&
+    body.success !== false &&
+    (body.code === undefined || body.code === 0 || body.code === '0')
+  )
+    return null
+  const diagnostic =
+    typeof body.msg === 'string' ? body.msg : typeof body.message === 'string' ? body.message : ''
+  const code =
+    typeof body.code === 'number' || typeof body.code === 'string' ? body.code : undefined
+  let kind: QueryErrorKind = 'UNKNOWN'
+  // -101 and 30001x meanings were verified against the current website client.
+  if (status === 429 || Number(code) === 300013 || /频繁|频率|rate.?limit/i.test(diagnostic))
+    kind = 'RATE_LIMITED'
+  else if (/安全验证|身份验证|验证码|captcha|verification required/i.test(diagnostic))
+    kind = 'VERIFICATION'
+  else if (
+    status === 401 ||
+    Number(code) === -101 ||
+    /未登录|登录.*(?:失效|过期)|login required|session expired/i.test(diagnostic)
+  )
+    kind = 'AUTH'
+  else if (
+    /签名.*(?:错误|无效|失效)|invalid signature|signature.*(?:invalid|expired)/i.test(diagnostic)
+  )
+    kind = 'SIGNATURE'
+  else if (Number(code) === 300015) kind = 'SIGNER'
+  else if (Number(code) === 300012) kind = 'NETWORK'
+  else if (
+    [403, 406, 461].includes(status) ||
+    Number(code) === 300011 ||
+    /没有权限访问|无权访问|access denied|access restricted/i.test(diagnostic)
+  )
+    kind = 'RESTRICTED'
+  else if (status >= 500 || status === 0) kind = 'NETWORK'
+  const seconds = retryAfter?.trim() ? Number(retryAfter) : NaN
+  const deadline = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(retryAfter ?? '')
+  const retryAt =
+    kind === 'RATE_LIMITED'
+      ? new Date(
+          Math.min(
+            8640000000000000,
+            Math.max(now + 60000, Number.isFinite(deadline) ? deadline : 0)
+          )
+        ).toISOString()
+      : undefined
+  const messages: Partial<Record<QueryErrorKind, string>> = {
+    AUTH: '网站确认登录已失效，请前往浏览器登录。',
+    VERIFICATION: '网站要求完成安全验证。',
+    RESTRICTED: '网站拒绝了本次查询，尚不能确认是登录问题。',
+    RATE_LIMITED: '网站要求降低查询频率。',
+    SIGNATURE: '网站未接受本次接口签名。',
+    SIGNER: '网站检测到浏览器环境异常，查询组件需要重新初始化。',
+    NETWORK:
+      Number(code) === 300012
+        ? '网站报告网络环境异常，请检查网络或代理设置。'
+        : '网站暂时无法响应，请检查网络后重试。'
   }
+  return new BrowserQueryError(
+    messages[kind] ?? '网站拒绝了本次查询，原因尚未确认。',
+    kind,
+    { httpStatus: status, businessCode: code, diagnostic, ...(retryAt ? { retryAt } : {}) },
+    secrets
+  )
 }
 
 export function isOnebox(url: string): boolean {
@@ -62,18 +124,13 @@ export function requestKeyword(postData?: string): string | null {
 }
 
 export function parseCandidates(payload: unknown, keyWord: string): BrowserCandidate[] {
-  if (!isRecord(payload)) throw new Error('网站返回了无法识别的数据')
-  if (payload.success === false) {
-    const diagnostic = String(payload.msg ?? payload.message ?? '')
-    throw new BrowserQueryError(
-      '网站拒绝查询，请在后台查询页检查登录或验证提示',
-      /频繁|频率|rate/i.test(diagnostic) ? 'RATE_LIMITED' : 'AUTH'
-    )
-  }
+  if (!isRecord(payload)) throw new BrowserQueryError('网站返回了无法识别的数据', 'SCHEMA')
+  const failure = responseError(200, payload, undefined, Date.now(), [keyWord])
+  if (failure) throw failure
   if (payload.success !== true)
     throw new BrowserQueryError('网站未确认查询成功，请稍后重新检查', 'SCHEMA')
   if (!isRecord(payload.data) || !Array.isArray(payload.data.onebox_list)) {
-    throw new Error('网站响应缺少用户搜索结果，请检查网页是否需要登录或验证')
+    throw new BrowserQueryError('网站响应缺少用户搜索结果，需要更新接口适配。', 'SCHEMA')
   }
   return payload.data.onebox_list.flatMap((entry: unknown): BrowserCandidate[] => {
     if (!isRecord(entry) || !isRecord(entry.user_one_box)) return []

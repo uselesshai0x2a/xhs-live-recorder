@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { isOnebox, officialUrl, parseCandidates, requestKeyword } from './protocol'
+import {
+  BrowserQueryError,
+  isOnebox,
+  officialUrl,
+  parseCandidates,
+  requestKeyword
+} from './protocol'
+import * as protocol from './protocol'
 
 describe('official browser boundary', () => {
   it.each([
@@ -28,6 +35,51 @@ describe('official browser boundary', () => {
 })
 
 describe('onebox response interpretation', () => {
+  it('treats an explicit access denial as restriction rather than expired login', () => {
+    expect(
+      protocol.responseError(200, {
+        success: false,
+        code: -104,
+        msg: '您当前登录的账号没有权限访问'
+      })
+    ).toMatchObject({ kind: 'RESTRICTED', issue: { action: 'verify' } })
+  })
+  it('rejects nonzero business codes even when the success flag is absent', () => {
+    expect(protocol.responseError(200, { code: 300013 })).toMatchObject({ kind: 'RATE_LIMITED' })
+    expect(protocol.responseError(200, { code: 987654 })).toMatchObject({ kind: 'UNKNOWN' })
+  })
+  it('does not diagnose an undocumented business rejection as expired login', () => {
+    try {
+      parseCandidates({ success: false, code: 876543, msg: 'unexpected rejection' }, 'alice')
+      expect.fail('query must reject')
+    } catch (error) {
+      expect(error).toMatchObject({ kind: 'UNKNOWN' })
+    }
+  })
+  it('retains actionable structured diagnostics instead of only an error number', () => {
+    const error = new BrowserQueryError('连接超时', 'NETWORK')
+    expect(error).toMatchObject({
+      issue: { kind: 'NETWORK', action: 'retry', title: '网络连接失败' }
+    })
+  })
+  it.each([403, 406])('does not label bare HTTP %s as logged out', (status) => {
+    expect(protocol.responseError(status, null)).toMatchObject({ kind: 'RESTRICTED' })
+  })
+  it('honors a longer Retry-After without shortening it to one minute', () => {
+    const error = protocol.responseError(429, { success: false }, '180', 1000000)
+    expect(error?.issue.retryAt).toBe(new Date(1180000).toISOString())
+  })
+  it('separates explicit authentication, verification and signature failures', () => {
+    expect(protocol.responseError(200, { success: false, code: -101 })).toMatchObject({
+      kind: 'AUTH'
+    })
+    expect(protocol.responseError(200, { success: false, msg: '请完成安全验证' })).toMatchObject({
+      kind: 'VERIFICATION'
+    })
+    expect(protocol.responseError(200, { success: false, msg: 'invalid signature' })).toMatchObject(
+      { kind: 'SIGNATURE' }
+    )
+  })
   const response = (live_info: unknown): unknown => ({
     success: true,
     data: {

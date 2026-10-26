@@ -7,6 +7,7 @@ import type {
   Settings,
   Target
 } from '@xhs-live-recorder/core'
+import type { QueryIssue, QueryBlockKind, QueryRecoveryAction } from '@xhs-live-recorder/core'
 import type { BrowserSnapshot } from './browser'
 export interface AppSnapshot {
   targets: Target[]
@@ -16,11 +17,14 @@ export interface AppSnapshot {
   notices: Notice[]
   paused: boolean
   authBlocked: boolean
-  queryBlockKind: 'AUTH' | 'RESTRICTED' | 'RATE_LIMITED' | null
+  queryBlockKind: QueryBlockKind | null
+  queryError: QueryIssue | null
   pendingConfirmations: string[]
   browser: BrowserSnapshot
 }
 export interface AppApi {
+  recoverQuery(action: QueryRecoveryAction, targetId?: string): Promise<void>
+  copyDiagnostic(id: string): Promise<void>
   snapshot(): Promise<AppSnapshot>
   search(keyword: string): Promise<Candidate[]>
   profile(): Promise<Candidate[]>

@@ -1,12 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { BrowserApi, BrowserSnapshot } from '../shared/browser'
 import type { AppApi, AppSnapshot } from '../shared/app'
+import type { TransportApi } from '../shared/query-error'
 
-const browser: BrowserApi = {
+const browser: TransportApi<BrowserApi> = {
   snapshot: () => ipcRenderer.invoke('browser:snapshot'),
   open: (url) => ipcRenderer.invoke('browser:open', url),
   search: (keyWord) => ipcRenderer.invoke('browser:search', keyWord),
-  showQueryPage: (show) => ipcRenderer.invoke('browser:worker', show),
+  setFocusMode: (focused) => ipcRenderer.invoke('browser:focus', focused),
   setBounds: (bounds) => ipcRenderer.invoke('browser:bounds', bounds),
   subscribe: (listener) => {
     const receive = (_event: Electron.IpcRendererEvent, state: BrowserSnapshot): void =>
@@ -16,7 +17,9 @@ const browser: BrowserApi = {
   }
 }
 contextBridge.exposeInMainWorld('browser', browser)
-const api: AppApi = {
+const api: TransportApi<AppApi> = {
+  recoverQuery: (action, targetId) => ipcRenderer.invoke('app:recover-query', { action, targetId }),
+  copyDiagnostic: (id) => ipcRenderer.invoke('app:copy-diagnostic', id),
   snapshot: () => ipcRenderer.invoke('app:snapshot'),
   search: (keyword) => ipcRenderer.invoke('app:search', keyword),
   profile: () => ipcRenderer.invoke('app:profile'),

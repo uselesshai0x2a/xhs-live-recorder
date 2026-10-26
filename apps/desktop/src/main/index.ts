@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   Menu,
@@ -19,6 +20,8 @@ import { validateSettings } from '@xhs-live-recorder/core'
 import { XhsBrowserService } from './browser/browser-service'
 import { SqliteStore } from './store'
 import { RecorderService } from './recorder-service'
+import { formatDiagnostic, toQueryIssue } from '../shared/query-error'
+import type { QueryIssue } from '@xhs-live-recorder/core'
 
 let window: BrowserWindow | null = null
 let browser: XhsBrowserService | null = null
@@ -31,6 +34,7 @@ let disposing = false
 let page = 'targets'
 let publishTimer: ReturnType<typeof setTimeout> | undefined
 const notifications = new Set<Notification>()
+const operationIssues = new Map<string, QueryIssue>()
 
 app.setName('XHS Live Recorder')
 if (!app.requestSingleInstanceLock()) app.quit()
@@ -159,9 +163,17 @@ async function start(): Promise<void> {
       throw new Error('拒绝未知页面请求')
   }
   const handle = (name: string, action: (value: unknown) => unknown): void => {
-    ipcMain.handle(name, (event, value: unknown) => {
+    ipcMain.handle(name, async (event, value: unknown) => {
       trusted(event)
-      return action(value)
+      try {
+        return { ok: true, value: await action(value) }
+      } catch (error) {
+        const issue = toQueryIssue(error)
+        operationIssues.set(issue.id, issue)
+        while (operationIssues.size > 30)
+          operationIssues.delete(operationIssues.keys().next().value!)
+        return { ok: false, error: issue }
+      }
     })
   }
   const string = (value: unknown): string => {
@@ -186,6 +198,35 @@ async function start(): Promise<void> {
   if (process.env.XHS_START_PAUSED === '1') service.setPaused(true)
 
   handle('app:snapshot', () => service!.snapshot())
+  handle('app:copy-diagnostic', (value) => {
+    const id = string(value)
+    const snapshot = service!.snapshot()
+    const issue = [
+      operationIssues.get(id),
+      snapshot.queryError,
+      snapshot.browser.lastError,
+      ...snapshot.targets.map((t) => t.queryError)
+    ].find((e) => e?.id === id)
+    if (!issue) throw new Error('诊断记录已更新，请重新查询')
+    clipboard.writeText(formatDiagnostic(issue))
+  })
+  handle('app:recover-query', async (value) => {
+    if (!value || typeof value !== 'object') throw new Error('无效恢复操作')
+    const { action, targetId } = value as { action: unknown; targetId: unknown }
+    if (!['login', 'verify', 'retry', 'repair'].includes(String(action)))
+      throw new Error('无效恢复操作')
+    if (targetId !== undefined) string(targetId)
+    if (action === 'login' || action === 'verify') {
+      page = 'browser'
+      showWindow()
+      window!.webContents.send('app:watch')
+      await browser!.openRecoveryPage()
+      browser!.setVisible(true)
+      return
+    }
+    if (action === 'repair') browser!.resetSigner()
+    await service!.retryQuery(targetId as string | undefined)
+  })
   handle('app:search', (value) => service!.search(string(value)))
   handle('app:profile', () => service!.profile())
   handle('app:remove', (value) => service!.remove(string(value)))
@@ -253,10 +294,9 @@ async function start(): Promise<void> {
     browser!.setVisible(page === 'browser')
   })
   handle('browser:search', (value) => service!.search(string(value)))
-  handle('browser:worker', (value) => {
-    if (typeof value !== 'boolean') throw new Error('无效页面选择')
-    browser!.showQueryPage(value)
-    browser!.setVisible(page === 'browser')
+  handle('browser:focus', (value) => {
+    if (typeof value !== 'boolean') throw new Error('无效观看模式')
+    browser!.setFocusMode(value && page === 'browser')
   })
   handle('browser:bounds', (value) => {
     if (!value || typeof value !== 'object') throw new Error('无效尺寸')

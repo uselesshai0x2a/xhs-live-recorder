@@ -1,177 +1,265 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { BrowserWindow } from 'electron'
 import type { EventEmitter } from 'node:events'
-import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-
-interface FakeView {
-  options: { webPreferences: Record<string, unknown> }
-  webContents: {
-    getURL: Mock
-    emit: EventEmitter['emit']
-    debugger: EventEmitter & { sendCommand: Mock }
-    loadURL: Mock
-    setAudioMuted: Mock
-  }
+import type { SignedRequest } from './signer-runtime'
+type FakeContents = EventEmitter & {
+  url: string
+  muted: boolean
+  loadURL: ReturnType<typeof vi.fn>
 }
-
-const fakes = vi.hoisted(() => ({
+type FakeView = { webContents: FakeContents; visible: boolean; bounds: unknown; options: unknown }
+type FakeSession = {
+  cookies: EventEmitter & {
+    get: () => Promise<Partial<Electron.Cookie>[]>
+    flushStore: ReturnType<typeof vi.fn>
+  }
+  fetch: ReturnType<typeof vi.fn>
+  webRequest: unknown
+  flushStorageData: ReturnType<typeof vi.fn>
+  setPermissionRequestHandler: ReturnType<typeof vi.fn>
+  setPermissionCheckHandler: ReturnType<typeof vi.fn>
+}
+const f = vi.hoisted(() => ({
   views: [] as FakeView[],
-  partition: vi.fn(),
-  cookieGet: vi.fn(),
-  headerHook: vi.fn()
+  cookies: [] as Partial<Electron.Cookie>[],
+  fetch: vi.fn(),
+  sign: vi.fn(),
+  reset: vi.fn(),
+  session: null as unknown as FakeSession
 }))
-vi.mock('node:fs/promises', () => ({
-  mkdir: vi.fn().mockResolvedValue(undefined),
-  appendFile: vi.fn().mockResolvedValue(undefined)
+vi.mock('node:fs/promises', () => ({ mkdir: vi.fn(), appendFile: vi.fn() }))
+vi.mock('./query-transport', () => ({
+  ONEBOX_API: 'https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox',
+  queryTransport: (_session: unknown, signed: SignedRequest, signal: AbortSignal) =>
+    f.fetch('https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox', {
+      method: 'POST',
+      credentials: 'include',
+      ...signed,
+      signal
+    })
+}))
+vi.mock('./signer-runtime', async (original) => ({
+  ...(await original<typeof import('./signer-runtime')>()),
+  SignerRuntime: class {
+    constructor(
+      _view: unknown,
+      private changed: (s: string) => void
+    ) {}
+    async sign(keyword: string): Promise<SignedRequest> {
+      this.changed('ready')
+      return f.sign(keyword)
+    }
+    reset(): void {
+      f.reset()
+      this.changed('idle')
+    }
+  }
 }))
 vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events')
   class Contents extends EventEmitter {
     debugger = Object.assign(new EventEmitter(), {
       attach: vi.fn(),
-      sendCommand: vi.fn().mockResolvedValue({ body: '{"success":true,"data":{"onebox_list":[]}}' })
+      sendCommand: vi.fn(async () => ({}))
     })
-    loadURL = vi.fn().mockResolvedValue(undefined)
-    setAudioMuted = vi.fn()
-    isAudioMuted = vi.fn().mockReturnValue(false)
+    url = 'https://www.xiaohongshu.com/explore'
+    muted = false
+    loadURL = vi.fn(async (url: string) => {
+      this.url = url
+    })
+    getURL = (): string => this.url
+    setAudioMuted = (value: boolean): void => {
+      this.muted = value
+    }
+    isAudioMuted = (): boolean => this.muted
     setWindowOpenHandler = vi.fn()
-    getURL = vi.fn().mockReturnValue('https://www.xiaohongshu.com/explore')
     close = vi.fn()
+    stop = vi.fn()
   }
-  const sharedSession = {
+  f.session = {
+    cookies: Object.assign(new EventEmitter(), { get: async () => f.cookies, flushStore: vi.fn() }),
+    fetch: f.fetch,
+    webRequest: { onBeforeSendHeaders: vi.fn() },
+    flushStorageData: vi.fn(),
     setPermissionRequestHandler: vi.fn(),
-    setPermissionCheckHandler: vi.fn(),
-    cookies: { get: fakes.cookieGet, flushStore: vi.fn().mockResolvedValue(undefined) },
-    webRequest: { onBeforeSendHeaders: fakes.headerHook }
+    setPermissionCheckHandler: vi.fn()
   }
-  fakes.partition.mockReturnValue(sharedSession)
   return {
-    session: { fromPartition: fakes.partition },
+    session: { fromPartition: vi.fn(() => f.session) },
     WebContentsView: class {
       webContents = new Contents()
-      setVisible = vi.fn()
-      setBounds = vi.fn()
-      constructor(readonly options: FakeView['options']) {
-        fakes.views.push(this)
+      visible = false
+      bounds: unknown
+      setBounds(b: unknown): void {
+        this.bounds = b
+      }
+      setVisible(v: boolean): void {
+        this.visible = v
+      }
+      constructor(readonly options: unknown) {
+        f.views.push(this)
       }
     }
   }
 })
-
 import { XhsBrowserService } from './browser-service'
-import type { BrowserWindow } from 'electron'
-
 let service: XhsBrowserService
-beforeEach(() => {
+beforeEach(async () => {
   vi.useFakeTimers()
-  fakes.views.length = 0
-  fakes.cookieGet.mockResolvedValue([])
-  const window = { contentView: { addChildView: vi.fn() }, getContentSize: () => [1200, 800] }
-  service = new XhsBrowserService(window as unknown as BrowserWindow, 'test/browser.log', vi.fn())
+  vi.clearAllMocks()
+  f.views.length = 0
+  f.cookies = [{ name: 'web_session', value: 'secret-session', expirationDate: 2000000000 }]
+  f.fetch.mockImplementation(
+    async () =>
+      new Response(JSON.stringify({ success: true, data: { onebox_list: [] } }), { status: 200 })
+  )
+  f.sign.mockImplementation(async (keyword: string) => ({
+    body: JSON.stringify({ keyword }),
+    headers: { 'x-s': 'secret-signature', 'x-t': '123', 'x-s-common': 'secret-common' }
+  }))
+  const { EventEmitter } = await import('node:events')
+  const win = {
+    contentView: { addChildView: vi.fn() },
+    getContentSize: () => [1200, 800],
+    webContents: new EventEmitter()
+  }
+  service = new XhsBrowserService(win as unknown as BrowserWindow, 'test/browser.log', vi.fn())
+  await service.initialize()
 })
 afterEach(async () => {
   await service.dispose()
   vi.useRealTimers()
+  f.session.cookies.removeAllListeners()
 })
-
-describe('browser query lifecycle', () => {
-  it('classifies HTTP 461 as a website restriction without accepting a response body', async () => {
-    const result = service.search('alice')
-    const rejected = expect(result).rejects.toMatchObject({ kind: 'RESTRICTED' })
-    const cdp = fakes.views[1].webContents.debugger
-    cdp.emit('message', {}, 'Network.requestWillBeSent', {
-      requestId: 'restricted',
-      request: {
-        url: 'https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox',
-        postData: '{"keyword":"alice"}'
-      }
-    })
-    cdp.emit('message', {}, 'Network.responseReceived', {
-      requestId: 'restricted',
-      response: { status: 461 }
-    })
-    cdp.emit('message', {}, 'Network.loadingFinished', { requestId: 'restricted' })
-    await rejected
-    expect(cdp.sendCommand).not.toHaveBeenCalled()
-  })
-  it('recognizes verification immediately, preserves its page and signals recovery', async () => {
-    const worker = fakes.views[1].webContents
-    const result = service.search('alice')
-    const rejected = expect(result).rejects.toMatchObject({ kind: 'AUTH' })
-    worker.getURL.mockReturnValue('https://www.xiaohongshu.com/website-login/captcha')
-    worker.emit('did-navigate')
-    await rejected
-    await expect(service.search('bob')).rejects.toThrow('扫码')
-    expect(worker.loadURL).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(45000)
-    expect(service.snapshot().evidence.some((e) => e.message.includes('超时'))).toBe(false)
-    const version = service.snapshot().authVersion ?? 0
-    worker.getURL.mockReturnValue('https://www.xiaohongshu.com/search_result?keyword=alice')
-    worker.emit('did-navigate-in-page')
-    expect(service.snapshot().authVersion).toBe(version + 1)
-  })
-  it('isolates remote pages from Node and shares only the account session', () => {
-    expect(fakes.partition).toHaveBeenCalledWith('persist:xhs-account')
-    const [foreground, worker] = fakes.views
-    expect(foreground.options.webPreferences).toMatchObject({
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false
-    })
-    expect(worker.options.webPreferences.session).toBe(foreground.options.webPreferences.session)
-    expect(worker.webContents.setAudioMuted).toHaveBeenCalledWith(true)
-  })
-
-  it('queries only the worker and rejects concurrent searches', async () => {
-    const result = service.search('alice')
-    const rejection = expect(result).rejects.toThrow('超时')
-    await expect(service.search('bob')).rejects.toThrow('正在查询')
-    expect(fakes.views[0].webContents.loadURL).not.toHaveBeenCalled()
-    expect(fakes.views[1].webContents.loadURL).toHaveBeenCalledWith(
-      expect.stringContaining('keyword=alice')
+describe('direct browser-session queries', () => {
+  it('detects cookie renewal without changing its value and retains diagnostic IDs', async () => {
+    const previous = service.snapshot().authVersion
+    f.cookies[0].expirationDate = 2000000300
+    f.session.cookies.emit(
+      'changed',
+      {},
+      { name: 'web_session', domain: '.xiaohongshu.com' },
+      'explicit',
+      false
     )
-    await vi.advanceTimersByTimeAsync(45000)
-    await rejection
+    await vi.advanceTimersByTimeAsync(400)
+    expect(service.snapshot().authVersion).toBeGreaterThan(previous ?? 0)
+    f.fetch.mockResolvedValue(new Response('denied', { status: 461 }))
+    await service.search('alice').catch(() => {})
+    const snapshot = service.snapshot()
+    expect(snapshot.evidence.some((e) => e.message.includes(snapshot.lastError!.id))).toBe(true)
+  })
+  it('sends signed bytes with the shared session without navigating either page', async () => {
+    f.views[0].webContents.loadURL.mockClear()
+    await expect(service.search('alice')).resolves.toEqual([])
+    expect(f.fetch).toHaveBeenCalledWith(
+      'https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+        body: '{"keyword":"alice"}'
+      })
+    )
+    expect(f.views[0].webContents.loadURL).not.toHaveBeenCalled()
+    expect(f.views[1].webContents.loadURL).not.toHaveBeenCalled()
+    expect(service.snapshot().queryReady).toBe(true)
+  })
+  it('does not permanently gate queries on a stale hidden verification URL', async () => {
+    f.views[1].webContents.url = 'https://www.xiaohongshu.com/website-login/captcha'
+    f.cookies = [{ name: 'web_session', value: 'new-session' }]
+    f.session.cookies.emit(
+      'changed',
+      {},
+      { name: 'web_session', domain: '.xiaohongshu.com' },
+      'explicit',
+      false
+    )
+    await vi.advanceTimersByTimeAsync(400)
+    await expect(service.search('alice')).resolves.toEqual([])
+    expect(f.reset).toHaveBeenCalled()
+  })
+  it('rejects an in-flight response after the account changes without declaring it ready', async () => {
+    let resolve!: (r: Response) => void
+    f.fetch.mockReturnValue(
+      new Promise((r) => {
+        resolve = r
+      })
+    )
+    const result = service.search('alice')
+    const rejected = expect(result).rejects.toMatchObject({ kind: 'SESSION_CHANGED' })
+    await vi.advanceTimersByTimeAsync(0)
+    f.session.cookies.emit(
+      'changed',
+      {},
+      { name: 'web_session', domain: '.xiaohongshu.com' },
+      'overwrite',
+      true
+    )
+    resolve(new Response('{"success":true,"data":{"onebox_list":[]}}'))
+    await rejected
+    expect(service.snapshot().queryReady).toBe(false)
+    expect(service.snapshot().candidates).toEqual([])
+  })
+  it('never marks HTTP restrictions as a successful or offline query', async () => {
+    f.fetch.mockResolvedValue(new Response('denied', { status: 461 }))
+    await expect(service.search('alice')).rejects.toMatchObject({
+      kind: 'RESTRICTED',
+      issue: { httpStatus: 461, action: 'verify' }
+    })
+    expect(service.snapshot().queryReady).toBe(false)
+  })
+  it('bounds even a transport that ignores abort and releases the query slot', async () => {
+    f.fetch.mockReturnValue(new Promise(() => {}))
+    const result = service.search('alice')
+    const rejected = expect(result).rejects.toMatchObject({ kind: 'TIMEOUT' })
+    await vi.advanceTimersByTimeAsync(45001)
+    await rejected
     expect(service.snapshot().queryRunning).toBe(false)
   })
-
-  it('correlates response bodies with the active keyword and request id', async () => {
-    const result = service.search('alice')
-    const cdp = fakes.views[1].webContents.debugger
-    const url = 'https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox'
-    cdp.emit('message', {}, 'Network.requestWillBeSent', {
-      requestId: 'wrong',
-      request: { url, postData: '{"keyword":"bob"}' }
-    })
-    cdp.emit('message', {}, 'Network.loadingFinished', { requestId: 'wrong' })
-    expect(cdp.sendCommand).not.toHaveBeenCalled()
-    cdp.emit('message', {}, 'Network.requestWillBeSent', {
-      requestId: 'match',
-      request: { url, postData: '{"keyword":"alice"}' }
-    })
-    cdp.emit('message', {}, 'Network.responseReceived', {
-      requestId: 'match',
-      response: { status: 200 }
-    })
-    cdp.emit('message', {}, 'Network.loadingFinished', { requestId: 'match' })
-    await expect(result).resolves.toEqual([])
-    expect(cdp.sendCommand).toHaveBeenCalledWith('Network.getResponseBody', { requestId: 'match' })
+  it('reinitializes the signer only once on a signature rejection', async () => {
+    f.fetch.mockImplementation(
+      async () => new Response('{"success":false,"msg":"invalid signature"}')
+    )
+    await expect(service.search('alice')).rejects.toMatchObject({ kind: 'SIGNATURE' })
+    expect(f.fetch).toHaveBeenCalledTimes(2)
+    expect(f.reset).toHaveBeenCalledTimes(1)
   })
-
-  it('continues an active query while hidden and restores the previous mute setting', async () => {
-    const result = service.search('alice')
-    const rejection = expect(result).rejects.toThrow('应用已退出')
+  it('does not expose credential values or search identity in diagnostics', async () => {
+    await service.search('private-search')
+    const state = JSON.stringify(service.snapshot())
+    expect(state).not.toContain('secret-')
+    expect(state).not.toContain('private-search')
+    expect(service.snapshot().cookieExpiresAt).toBe(new Date(2000000000000).toISOString())
+  })
+  it('preserves playback mute state and query operation when hidden', async () => {
     service.setHidden(true)
-    expect(service.snapshot().queryRunning).toBe(true)
-    expect(fakes.views[0].webContents.setAudioMuted).toHaveBeenLastCalledWith(true)
+    expect(f.views[0].webContents.muted).toBe(true)
+    await expect(service.search('alice')).resolves.toEqual([])
     service.setHidden(false)
-    expect(fakes.views[0].webContents.setAudioMuted).toHaveBeenLastCalledWith(false)
-    await service.dispose()
-    await rejection
+    expect(f.views[0].webContents.muted).toBe(false)
   })
-
-  it('does not expose captured credential values in snapshots or evidence', () => {
-    const callback = fakes.headerHook.mock.calls.at(-1)![1]
-    callback({ requestHeaders: { 'X-S': 'secret-signature', Cookie: 'secret-cookie' } }, vi.fn())
-    expect(service.snapshot().signedRequestObserved).toBe(true)
-    expect(JSON.stringify(service.snapshot())).not.toContain('secret-')
+  it('restores focus mode from remote Escape but gives video fullscreen the first Escape', () => {
+    service.setFocusMode(true)
+    f.views[0].webContents.emit('enter-html-full-screen')
+    f.views[0].webContents.emit(
+      'before-input-event',
+      { preventDefault: vi.fn() },
+      { type: 'keyDown', key: 'Escape' }
+    )
+    expect(service.snapshot().focusMode).toBe(true)
+    f.views[0].webContents.emit('leave-html-full-screen')
+    f.views[0].webContents.emit(
+      'before-input-event',
+      { preventDefault: vi.fn() },
+      { type: 'keyDown', key: 'Escape' }
+    )
+    expect(service.snapshot().focusMode).toBe(false)
+  })
+  it('exits focus when leaving the browser and keeps the signing surface hidden', () => {
+    service.setFocusMode(true)
+    service.setVisible(false)
+    expect(service.snapshot().focusMode).toBe(false)
+    service.setVisible(true)
+    expect(f.views[1].visible).toBe(false)
   })
 })

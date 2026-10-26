@@ -30,6 +30,29 @@ afterEach(() => {
   }
 })
 describe('SQLite persistence and recovery', () => {
+  it('upgrades version 2 incrementally and retains structured diagnostics on reopening', () => {
+    const f = fixture(),
+      target = f.store.add(candidate)
+    f.store.db.exec('DROP TABLE query_errors; PRAGMA user_version=2')
+    f.store.close()
+    let reopened = new SqliteStore(path.join(f.root, 'recorder.db'), f.root)
+    const issue = new BrowserQueryError('等待冷却', 'RATE_LIMITED', {
+      retryAt: new Date(Date.now() + 180000).toISOString()
+    }).issue
+    reopened.saveTarget({
+      ...reopened.target(target.id)!,
+      errorKind: 'RATE_LIMITED',
+      error: issue.message,
+      queryError: issue
+    })
+    reopened.account('RATE_LIMITED', issue)
+    reopened.close()
+    reopened = new SqliteStore(path.join(f.root, 'recorder.db'), f.root)
+    resources[0].store = reopened
+    expect(reopened.target(target.id)?.queryError).toEqual(issue)
+    expect(reopened.queryIssue()).toEqual(issue)
+    expect(reopened.settings().outputDir).toBe(f.root)
+  })
   it('rolls back all migration changes when an incompatible column is found', () => {
     const f = fixture()
     f.store.db.exec(
@@ -61,7 +84,7 @@ describe('SQLite persistence and recovery', () => {
     f.store.close()
     const reopened = new SqliteStore(path.join(f.root, 'recorder.db'), f.root)
     resources[0].store = reopened
-    expect(reopened.db.pragma('user_version', { simple: true })).toBe(2)
+    expect(reopened.db.pragma('user_version', { simple: true })).toBe(3)
     expect(reopened.target(target.id)).toMatchObject({
       archivedAt: null,
       generation: 0,
@@ -239,21 +262,24 @@ describe('recording coordination', () => {
     await Promise.all([first, queued])
     expect(f.browser.search).toHaveBeenCalledOnce()
   })
-  it('does not start a new recording when monitoring is paused during an automatic query', async () => {
-    const f = setup()
-    let finish!: (value: Candidate[]) => void
-    vi.mocked(f.browser.search).mockReturnValue(
-      new Promise((resolve) => {
-        finish = resolve
-      })
-    )
-    const checking = f.service.check(f.target.id, true)
-    await vi.waitFor(() => expect(f.browser.search).toHaveBeenCalledOnce())
-    f.service.setPaused(true)
-    finish([candidate])
-    await checking
-    expect(f.start).not.toHaveBeenCalled()
-  })
+  it.each([true, false])(
+    'does not start a new recording when paused during a query (automatic=%s)',
+    async (automatic) => {
+      const f = setup()
+      let finish!: (value: Candidate[]) => void
+      vi.mocked(f.browser.search).mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve
+        })
+      )
+      const checking = f.service.check(f.target.id, automatic)
+      await vi.waitFor(() => expect(f.browser.search).toHaveBeenCalledOnce())
+      f.service.setPaused(true)
+      finish([candidate])
+      await checking
+      expect(f.start).not.toHaveBeenCalled()
+    }
+  )
   it('archives before waiting for an active recorder to stop, and coalesces duplicate removals', async () => {
     const f = setup()
     let finish!: () => void
@@ -426,5 +452,194 @@ describe('recording coordination', () => {
     await expect(f.service.check(f.target.id)).rejects.toThrow('重新登录')
     expect(f.service.authBlocked).toBe(true)
     expect(stop).not.toHaveBeenCalled()
+  })
+  it('does not persist a cancelled old-session response as a failed target check', async () => {
+    const f = setup()
+    vi.mocked(f.browser.search).mockRejectedValue(
+      new BrowserQueryError('会话变化', 'SESSION_CHANGED')
+    )
+    await f.service.check(f.target.id)
+    expect(f.store.target(f.target.id)?.error).toBeNull()
+    expect(f.start).not.toHaveBeenCalled()
+  })
+  it('persists structured failures and the server cooldown across restarts', async () => {
+    const f = setup()
+    const retryAt = new Date(Date.now() + 180000).toISOString()
+    const failure = new BrowserQueryError('频率限制', 'RATE_LIMITED', {
+      httpStatus: 429,
+      businessCode: 300013,
+      retryAt
+    })
+    vi.mocked(f.browser.search).mockRejectedValue(failure)
+    await expect(f.service.check(f.target.id)).rejects.toThrow()
+    expect(f.store.target(f.target.id)?.queryError).toMatchObject({ id: failure.issue.id, retryAt })
+    const restored = new RecorderService(
+      f.store,
+      f.browser,
+      'unused',
+      () => {},
+      () => {}
+    )
+    expect(restored.snapshot().queryError).toMatchObject({ retryAt })
+    await expect(restored.search('alice')).rejects.toMatchObject({ issue: { retryAt } })
+  })
+  it('blocks signer failures without asking the user to log in again', async () => {
+    const f = setup()
+    vi.mocked(f.browser.search).mockRejectedValue(new BrowserQueryError('签名未就绪', 'SIGNER'))
+    await expect(f.service.check(f.target.id)).rejects.toThrow()
+    expect(f.service.snapshot()).toMatchObject({
+      queryBlockKind: 'SIGNER',
+      queryError: { action: 'repair' }
+    })
+    await f.service.check(f.target.id, true)
+    expect(f.browser.search).toHaveBeenCalledOnce()
+  })
+  it('immediately coalesces one auth recovery even when the target is not due', async () => {
+    const f = setup()
+    f.store.saveTarget({ ...f.target, checkedAt: new Date().toISOString() })
+    f.service.queryBlockKind = 'AUTH'
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({ authVersion: 5 } as ReturnType<
+      XhsBrowserService['snapshot']
+    >)
+    vi.mocked(f.browser.search).mockRejectedValue(new BrowserQueryError('仍需验证', 'AUTH'))
+    vi.useFakeTimers()
+    try {
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(10000)
+      expect(f.browser.search).toHaveBeenCalledOnce()
+      expect(f.service.authBlocked).toBe(true)
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it('validates login once with the last search when no target exists, including paused monitoring', async () => {
+    const f = setup()
+    f.store.remove(f.target.id)
+    f.service.setPaused(true)
+    vi.mocked(f.browser.search).mockRejectedValue(new BrowserQueryError('未登录', 'AUTH'))
+    await expect(f.service.search('alice')).rejects.toThrow()
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({ authVersion: 5 } as ReturnType<
+      XhsBrowserService['snapshot']
+    >)
+    vi.useFakeTimers()
+    try {
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(15000)
+      expect(f.browser.search).toHaveBeenCalledTimes(2)
+      expect(f.start).not.toHaveBeenCalled()
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it('also validates changed authorization after an explicit access restriction', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    vi.mocked(f.browser.search)
+      .mockRejectedValueOnce(new BrowserQueryError('没有访问权限', 'RESTRICTED'))
+      .mockResolvedValue([candidate])
+    await expect(f.service.search('alice')).rejects.toThrow()
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({ authVersion: 6 } as ReturnType<
+      XhsBrowserService['snapshot']
+    >)
+    vi.useFakeTimers()
+    try {
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(12000)
+      expect(f.browser.search).toHaveBeenCalledTimes(2)
+      expect(f.service.snapshot().queryBlockKind).toBeNull()
+      expect(f.start).not.toHaveBeenCalled()
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it('does not repeat validation when a successful query already used the current session', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    await f.service.search('alice')
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({
+      authVersion: 6,
+      queryReady: true
+    } as ReturnType<XhsBrowserService['snapshot']>)
+    vi.useFakeTimers()
+    try {
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(12000)
+      expect(f.browser.search).toHaveBeenCalledOnce()
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it('acknowledges a successfully used auth version before a later restriction', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({
+      authVersion: 6,
+      queryReady: true
+    } as ReturnType<XhsBrowserService['snapshot']>)
+    await f.service.search('alice')
+    vi.mocked(f.browser.search).mockRejectedValue(new BrowserQueryError('限制访问', 'RESTRICTED'))
+    vi.mocked(f.browser.snapshot).mockReturnValue({
+      authVersion: 6,
+      queryReady: false
+    } as ReturnType<XhsBrowserService['snapshot']>)
+    vi.useFakeTimers()
+    try {
+      const failure = expect(f.service.search('alice')).rejects.toThrow()
+      await vi.advanceTimersByTimeAsync(6000)
+      await failure
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(12000)
+      expect(f.browser.search).toHaveBeenCalledTimes(2)
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it('coalesces an auth probe queued behind an already successful in-flight query', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    let resolve!: (value: Candidate[]) => void
+    vi.mocked(f.browser.search).mockReturnValueOnce(
+      new Promise((r) => {
+        resolve = r
+      })
+    )
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({
+      authVersion: 6,
+      queryReady: false
+    } as ReturnType<XhsBrowserService['snapshot']>)
+    vi.useFakeTimers()
+    try {
+      const first = f.service.search('alice')
+      await vi.advanceTimersByTimeAsync(1)
+      f.service.start()
+      vi.mocked(f.browser.snapshot).mockReturnValue({
+        authVersion: 6,
+        queryReady: true
+      } as ReturnType<XhsBrowserService['snapshot']>)
+      resolve([candidate])
+      await first
+      await vi.advanceTimersByTimeAsync(12000)
+      expect(f.browser.search).toHaveBeenCalledOnce()
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
   })
 })

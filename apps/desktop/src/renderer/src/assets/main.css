@@ -473,6 +473,68 @@ h1 {
   flex: 1;
   min-height: 0;
 }
+.focus-exit-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 34px;
+  flex: 0 0 34px;
+  padding: 2px 10px;
+  background: #f5f6f8;
+  color: #67758a;
+  font-size: 11px;
+}
+.focus-exit-bar button {
+  padding: 2px 10px;
+  font-size: 12px;
+}
+.focus-mode main {
+  padding: 0;
+}
+.query-issue {
+  margin: 10px 20px;
+  padding: 12px 16px;
+  background: #fff5ee;
+  border: 1px solid #efd7c5;
+  border-radius: 8px;
+  color: #8a4826;
+  overflow-wrap: anywhere;
+}
+.target-info .query-issue {
+  margin: 10px 0;
+}
+.query-issue p {
+  color: #785d4d;
+  font-size: 12px;
+  margin-top: 4px;
+}
+.issue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+.issue-actions button {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+.query-issue summary {
+  cursor: pointer;
+  font-size: 12px;
+}
+.query-issue dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 11px;
+}
+.query-issue dd {
+  margin: 0;
+}
+.copy-feedback {
+  margin: 0 20px 8px;
+  color: #2e9664;
+}
 .run-card {
   padding: 20px 22px;
   border-bottom: 1px solid #eef0f4;

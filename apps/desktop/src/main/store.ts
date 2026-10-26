@@ -6,6 +6,7 @@ import {
   defaultSettings,
   type Candidate,
   type Notice,
+  type QueryIssue,
   type RecorderRepository,
   type RecordingFile,
   type RecordingRun,
@@ -24,7 +25,7 @@ export class SqliteStore implements RecorderRepository {
       this.db.pragma('busy_timeout = 5000')
       this.db.transaction(() => {
         const version = this.db.pragma('user_version', { simple: true }) as number
-        if (version > 2) throw new Error('数据库由更新版本创建，请使用对应版本应用')
+        if (version > 3) throw new Error('数据库由更新版本创建，请使用对应版本应用')
         if (version === 0) {
           this.db.exec(`
           CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1), outputDir TEXT NOT NULL, outputConfigured INTEGER NOT NULL, intervalMs INTEGER NOT NULL, requestIntervalMs INTEGER NOT NULL, warningGiB REAL NOT NULL, stopGiB REAL NOT NULL, segmentSeconds INTEGER NOT NULL, autoMerge INTEGER NOT NULL, keepSegments INTEGER NOT NULL, videoBitrate TEXT NOT NULL, startAtLogin INTEGER NOT NULL);
@@ -50,6 +51,11 @@ export class SqliteStore implements RecorderRepository {
           UPDATE targets SET lastConfirmedAt=checkedAt WHERE error IS NULL AND state IN ('live','offline');
           PRAGMA user_version=2;
         `)
+        }
+        if (version < 3) {
+          this.db.exec(
+            'CREATE TABLE IF NOT EXISTS query_errors (scope TEXT PRIMARY KEY, error TEXT NOT NULL); PRAGMA user_version=3;'
+          )
         }
       })()
       this.recover()
@@ -87,6 +93,7 @@ export class SqliteStore implements RecorderRepository {
     return row
       ? {
           ...row,
+          queryError: this.queryIssue(row.id),
           enabled: Boolean(row.enabled),
           notify: Boolean(row.notify),
           autoRecord: Boolean(row.autoRecord)
@@ -147,13 +154,16 @@ export class SqliteStore implements RecorderRepository {
     return target
   }
   saveTarget(t: Target): void {
-    this.db
-      .prepare(
-        `INSERT INTO targets VALUES(@id,@keyWord,@userId,@name,@state,@roomId,@pageUrl,@enabled,@notify,@autoRecord,@checkedAt,@error,@blockedRoomId,@blockedReason,@retryAt,@archivedAt,@generation,@errorKind,@lastConfirmedAt)
+    this.db.transaction(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO targets VALUES(@id,@keyWord,@userId,@name,@state,@roomId,@pageUrl,@enabled,@notify,@autoRecord,@checkedAt,@error,@blockedRoomId,@blockedReason,@retryAt,@archivedAt,@generation,@errorKind,@lastConfirmedAt)
       ON CONFLICT(id) DO UPDATE SET keyWord=excluded.keyWord,userId=excluded.userId,name=excluded.name,state=excluded.state,roomId=excluded.roomId,pageUrl=excluded.pageUrl,enabled=excluded.enabled,notify=excluded.notify,autoRecord=excluded.autoRecord,checkedAt=excluded.checkedAt,error=excluded.error,blockedRoomId=excluded.blockedRoomId,blockedReason=excluded.blockedReason,retryAt=excluded.retryAt,errorKind=excluded.errorKind,lastConfirmedAt=excluded.lastConfirmedAt
       WHERE targets.generation=excluded.generation AND targets.archivedAt IS excluded.archivedAt`
-      )
-      .run({ ...t, enabled: +t.enabled, notify: +t.notify, autoRecord: +t.autoRecord })
+        )
+        .run({ ...t, enabled: +t.enabled, notify: +t.notify, autoRecord: +t.autoRecord })
+      if (result.changes) this.saveQueryIssue(t.id, t.queryError ?? null)
+    })()
   }
   remove(id: string): void {
     // Historical runs retain their owning target; removal archives the listener.
@@ -166,7 +176,12 @@ export class SqliteStore implements RecorderRepository {
   clearAccountErrors(): void {
     this.db
       .prepare(
-        "UPDATE targets SET error=NULL,errorKind=NULL WHERE errorKind IN ('AUTH','RESTRICTED','RATE_LIMITED')"
+        "DELETE FROM query_errors WHERE scope IN (SELECT id FROM targets WHERE errorKind IN ('AUTH','VERIFICATION','RESTRICTED','RATE_LIMITED','SIGNATURE','SIGNER','SCHEMA'))"
+      )
+      .run()
+    this.db
+      .prepare(
+        "UPDATE targets SET error=NULL,errorKind=NULL WHERE errorKind IN ('AUTH','VERIFICATION','RESTRICTED','RATE_LIMITED','SIGNATURE','SIGNER','SCHEMA')"
       )
       .run()
   }
@@ -264,7 +279,25 @@ export class SqliteStore implements RecorderRepository {
       .prepare('SELECT * FROM notices ORDER BY createdAt DESC LIMIT 50')
       .all() as Notice[]
   }
-  account(status: string): void {
+  queryIssue(scope = 'account'): QueryIssue | null {
+    const row = this.db.prepare('SELECT error FROM query_errors WHERE scope=?').get(scope) as
+      { error: string } | undefined
+    if (!row) return null
+    try {
+      return JSON.parse(row.error) as QueryIssue
+    } catch {
+      return null
+    }
+  }
+  private saveQueryIssue(scope: string, issue: QueryIssue | null): void {
+    if (issue)
+      this.db
+        .prepare('INSERT OR REPLACE INTO query_errors VALUES(?,?)')
+        .run(scope, JSON.stringify(issue))
+    else this.db.prepare('DELETE FROM query_errors WHERE scope=?').run(scope)
+  }
+  account(status: string, issue: QueryIssue | null = null): void {
+    this.saveQueryIssue('account', issue)
     this.db
       .prepare('INSERT OR REPLACE INTO account VALUES(1,?,?)')
       .run(status, new Date().toISOString())

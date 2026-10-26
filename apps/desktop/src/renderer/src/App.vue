@@ -1,9 +1,19 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import type { AppSnapshot } from '../../shared/app'
-import type { Candidate, RecordingFile, Settings, Target } from '@xhs-live-recorder/core'
-const api = globalThis.window.recorder
-const browser = globalThis.window.browser
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import type { AppApi, AppSnapshot } from '../../shared/app'
+import type { BrowserApi } from '../../shared/browser'
+import type {
+  Candidate,
+  RecordingFile,
+  Settings,
+  Target,
+  QueryIssue,
+  QueryRecoveryAction
+} from '@xhs-live-recorder/core'
+import { RemoteQueryError, unwrapApi } from '../../shared/query-error'
+import QueryErrorNotice from './components/QueryErrorNotice.vue'
+const api = unwrapApi<AppApi>(globalThis.window.recorder)
+const browser = unwrapApi<BrowserApi>(globalThis.window.browser)
 type Page = 'targets' | 'browser' | 'recordings' | 'settings'
 const page = ref<Page>('targets')
 const snapshot = ref<AppSnapshot>()
@@ -13,7 +23,12 @@ const candidates = ref<Candidate[]>([])
 const error = ref('')
 const busy = ref(false)
 const removingTarget = ref<Target>()
-const worker = ref(false)
+const actionIssue = ref<QueryIssue>()
+const focusMode = computed(
+  () => page.value === 'browser' && Boolean(snapshot.value?.browser.focusMode)
+)
+const accountIssue = computed(() => actionIssue.value ?? snapshot.value?.queryError ?? undefined)
+const copied = ref(false)
 const surface = ref<HTMLElement>()
 const selectedRun = ref('')
 const files = ref<RecordingFile[]>([])
@@ -60,15 +75,19 @@ function at(value: string | null): string {
 }
 async function action(fn: () => Promise<unknown>): Promise<void> {
   error.value = ''
+  actionIssue.value = undefined
+  copied.value = false
   busy.value = true
   try {
     await fn()
     if (api) snapshot.value = await api.snapshot()
   } catch (e) {
-    error.value =
-      e instanceof Error
-        ? e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
-        : String(e)
+    if (e instanceof RemoteQueryError) actionIssue.value = e.issue
+    else
+      error.value =
+        e instanceof Error
+          ? e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
+          : String(e)
   } finally {
     busy.value = false
   }
@@ -142,9 +161,16 @@ async function choose(): Promise<void> {
     if (directory && draft.value) draft.value.outputDir = directory
   })
 }
-async function toggleWorker(): Promise<void> {
-  worker.value = !worker.value
-  await action(() => browser.showQueryPage(worker.value))
+async function recoverQuery(recovery: QueryRecoveryAction, targetId?: string): Promise<void> {
+  await action(() => api.recoverQuery(recovery, targetId))
+}
+async function copyDiagnostic(id: string): Promise<void> {
+  try {
+    await api.copyDiagnostic(id)
+    copied.value = true
+  } catch {
+    error.value = '诊断信息复制失败，请重试'
+  }
 }
 async function showFiles(id: string): Promise<void> {
   selectedRun.value = id
@@ -163,6 +189,9 @@ onMounted(async () => {
     }),
     api.onWatch(() => {
       void setPage('browser')
+    }),
+    browser.subscribe((value) => {
+      if (snapshot.value) snapshot.value = { ...snapshot.value, browser: value }
     })
   )
   await action(async () => {
@@ -171,6 +200,23 @@ onMounted(async () => {
   observer = new ResizeObserver(resize)
   globalThis.window.addEventListener('resize', resize)
 })
+watch(focusMode, async () => {
+  await nextTick()
+  resize()
+})
+watch(
+  () => snapshot.value?.browser.queryReady,
+  (ready) => {
+    if (
+      ready &&
+      actionIssue.value &&
+      ['AUTH', 'VERIFICATION', 'RESTRICTED', 'SIGNATURE', 'SIGNER', 'RATE_LIMITED'].includes(
+        actionIssue.value.kind
+      )
+    )
+      actionIssue.value = undefined
+  }
+)
 onUnmounted(() => {
   observer?.disconnect()
   disposers.forEach((dispose) => dispose())
@@ -178,8 +224,8 @@ onUnmounted(() => {
 })
 </script>
 <template>
-  <div class="app-shell">
-    <aside class="sidebar">
+  <div class="app-shell" :class="{ 'focus-mode': focusMode }">
+    <aside v-show="!focusMode" class="sidebar">
       <div class="brand">
         <div class="brand-mark">●</div>
         <div><strong>XHS</strong><span>LIVE RECORDER</span></div>
@@ -202,7 +248,7 @@ onUnmounted(() => {
       </div>
     </aside>
     <main>
-      <header class="page-header">
+      <header v-show="!focusMode" class="page-header">
         <div>
           <span class="eyebrow">XHS LIVE RECORDER</span>
           <h1>{{ titles[page][0] }}</h1>
@@ -211,11 +257,9 @@ onUnmounted(() => {
         <div class="header-actions">
           <span class="session-pill" :class="{ warning: snapshot?.authBlocked }">{{
             snapshot?.authBlocked
-              ? snapshot.queryBlockKind === 'AUTH'
-                ? '需要重新登录或验证'
-                : '网站限制查询，请稍后手动检查'
-              : snapshot?.browser.signedRequestObserved
-                ? '浏览器查询已就绪'
+              ? (snapshot.queryError?.title ?? '查询暂不可用')
+              : snapshot?.browser.queryReady
+                ? '接口查询可用'
                 : snapshot?.browser.cookieAvailable
                   ? '登录已保留，等待查询'
                   : '在浏览器中登录'
@@ -229,14 +273,22 @@ onUnmounted(() => {
           </button>
         </div>
       </header>
-      <div v-if="error" role="alert" class="alert error">
+      <div v-if="!focusMode && error" role="alert" class="alert error">
         {{ error }}<button @click="error = ''">×</button>
       </div>
-      <div v-if="api && !api.removeTarget" class="alert setup">
+      <QueryErrorNotice
+        v-if="!focusMode && accountIssue"
+        :issue="accountIssue"
+        :busy="busy"
+        @recover="recoverQuery($event)"
+        @copy="copyDiagnostic"
+      />
+      <p v-if="copied && !focusMode" class="copy-feedback" role="status">已复制脱敏诊断信息</p>
+      <div v-if="!focusMode && api && !api.removeTarget" class="alert setup">
         新功能将在重启应用后启用，当前录制不受影响。
       </div>
       <div
-        v-if="snapshot && !snapshot.settings.outputConfigured && page !== 'settings'"
+        v-if="!focusMode && snapshot && !snapshot.settings.outputConfigured && page !== 'settings'"
         class="alert setup"
       >
         首次使用请确认录制目录，确认前只监听、不自动录制。<button @click="setPage('settings')">
@@ -319,7 +371,14 @@ onUnmounted(() => {
                 <p v-if="snapshot?.pendingConfirmations?.includes(target.id)" class="error-text">
                   录制流已结束，等待确认直播状态
                 </p>
-                <p v-if="target.error" class="error-text">{{ target.error }}</p>
+                <QueryErrorNotice
+                  v-if="target.queryError"
+                  :issue="target.queryError"
+                  :busy="busy"
+                  @recover="recoverQuery($event, target.id)"
+                  @copy="copyDiagnostic"
+                />
+                <p v-else-if="target.error" class="error-text">{{ target.error }}</p>
                 <p v-if="target.blockedReason" class="error-text">
                   {{ blockNames[target.blockedReason] }}
                   <button
@@ -388,23 +447,30 @@ onUnmounted(() => {
       </section>
 
       <section v-if="page === 'browser'" class="browser-content">
-        <div class="browser-toolbar">
+        <div v-if="focusMode" class="focus-exit-bar">
+          <span>专注观看 · Esc 恢复界面</span>
+          <button :aria-pressed="focusMode" @click="action(() => browser.setFocusMode(false))">
+            恢复界面
+          </button>
+        </div>
+        <div v-show="!focusMode" class="browser-toolbar">
           <button
             :disabled="!browser"
             @click="action(() => browser.open('https://www.xiaohongshu.com/explore'))"
           >
             首页 / 登录</button
           ><button :disabled="busy || !api" @click="fromProfile">＋ 添加当前主页主播</button
-          ><button :disabled="!browser" @click="toggleWorker">
-            {{ worker ? '返回观看页' : '查看后台查询页' }}</button
-          ><span>{{ worker ? '后台查询页始终静音' : '观看与后台录制独立运行' }}</span>
+          ><button
+            :disabled="!browser"
+            :aria-pressed="focusMode"
+            @click="action(() => browser.setFocusMode(true))"
+          >
+            收起界面
+          </button>
+          <span>观看与后台录制独立运行</span>
         </div>
-        <div class="browser-address">
-          {{
-            worker
-              ? '后台查询页 · 可处理登录或验证码'
-              : snapshot?.browser.foregroundUrl || '等待浏览器就绪'
-          }}
+        <div v-show="!focusMode" class="browser-address">
+          {{ snapshot?.browser.foregroundUrl || '等待浏览器就绪' }}
         </div>
         <div ref="surface" class="browser-surface"></div>
       </section>

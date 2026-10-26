@@ -13,6 +13,18 @@ import type { SqliteStore } from './store'
 import type { AppSnapshot } from '../shared/app'
 import { FfmpegRunner } from './media-runner'
 import { isTargetDue, randomRequestGap } from './scheduling'
+import type { QueryBlockKind, QueryIssue } from '@xhs-live-recorder/core'
+import { toQueryIssue } from '../shared/query-error'
+
+const blockKinds: QueryBlockKind[] = [
+  'AUTH',
+  'VERIFICATION',
+  'RESTRICTED',
+  'RATE_LIMITED',
+  'SIGNATURE',
+  'SIGNER',
+  'SCHEMA'
+]
 
 class SkippedQuery extends Error {}
 
@@ -21,6 +33,8 @@ export class RecorderService {
   readonly disk = new FileSystemDisk()
   paused = false
   queryBlockKind: AppSnapshot['queryBlockKind'] = null
+  queryError: QueryIssue | null = null
+  private lastKeyword: string | null = null
   get authBlocked(): boolean {
     return this.queryBlockKind !== null
   }
@@ -49,13 +63,20 @@ export class RecorderService {
     private random: () => number = Math.random
   ) {
     const status = store.accountStatus()
-    this.queryBlockKind =
-      status === 'RESTRICTED' || status === 'AUTH' || status === 'RATE_LIMITED'
-        ? status
-        : status === 'verification_required'
-          ? 'AUTH'
-          : null
-    if (this.queryBlockKind === 'RATE_LIMITED') this.rateUntil = Date.now() + 60000
+    this.queryBlockKind = blockKinds.includes(status as QueryBlockKind)
+      ? (status as QueryBlockKind)
+      : status === 'verification_required'
+        ? 'AUTH'
+        : null
+    this.queryError =
+      store.queryIssue() ??
+      (this.queryBlockKind
+        ? new BrowserQueryError('上次查询尚未恢复，请按提示处理后重试。', this.queryBlockKind).issue
+        : null)
+    if (this.queryBlockKind === 'RATE_LIMITED')
+      this.rateUntil = this.queryError?.retryAt
+        ? Date.parse(this.queryError.retryAt)
+        : Date.now() + 60000
     this.authVersion = browser.snapshot().authVersion ?? 0
     this.engine = new RecordingEngine(
       store,
@@ -77,6 +98,7 @@ export class RecorderService {
       paused: this.paused,
       authBlocked: this.authBlocked,
       queryBlockKind: this.queryBlockKind,
+      queryError: this.queryError,
       pendingConfirmations: [...this.pendingConfirmations.keys()],
       browser: this.browser.snapshot()
     }
@@ -91,10 +113,19 @@ export class RecorderService {
   }
   private async poll(): Promise<void> {
     while (!this.abort.signal.aborted) {
-      const version = this.browser.snapshot().authVersion ?? 0
+      const authorization = this.browser.snapshot()
+      const version = authorization.authVersion ?? 0
       if (version !== this.authVersion) {
         this.authVersion = version
-        if (this.queryBlockKind === 'AUTH') this.authRecoveryRequested = true
+        if (!authorization.queryReady && (this.lastKeyword || this.store.targets().length))
+          this.authRecoveryRequested = true
+      }
+      // Login validation is a read-only probe, including before the first target
+      // is added or while monitoring is paused. It cannot start a recording.
+      if (this.authRecoveryRequested && Date.now() >= this.rateUntil) {
+        const keyword = this.lastKeyword ?? this.store.targets()[0]?.keyWord
+        this.authRecoveryRequested = false
+        if (keyword) await this.search(keyword, { authorizationProbe: true }).catch(() => undefined)
       }
       if (this.canQueryAutomatically()) {
         for (const target of this.store.targets()) {
@@ -111,7 +142,8 @@ export class RecorderService {
           if (
             current &&
             current.enabled &&
-            (needsConfirmation ||
+            (this.authRecoveryRequested ||
+              needsConfirmation ||
               isTargetDue(current, this.store.settings(), Date.now(), recording))
           )
             await this.check(target.id, true).catch(() => undefined)
@@ -128,7 +160,8 @@ export class RecorderService {
       Date.now() >= this.rateUntil &&
       (!this.queryBlockKind ||
         this.queryBlockKind === 'RATE_LIMITED' ||
-        (this.queryBlockKind === 'AUTH' && this.authRecoveryRequested))
+        ((this.queryBlockKind === 'AUTH' || this.queryBlockKind === 'VERIFICATION') &&
+          this.authRecoveryRequested))
     )
   }
   private streamEnded(run: RecordingRun): void {
@@ -141,11 +174,13 @@ export class RecorderService {
   }
   search(
     keyword: string,
-    options: { automatic?: boolean; valid?: () => boolean } = {}
+    options: { automatic?: boolean; authorizationProbe?: boolean; valid?: () => boolean } = {}
   ): Promise<Candidate[]> {
     const blockVersion = this.blockVersion
     const validate = (): void => {
       if (this.abort.signal.aborted) throw new SkippedQuery('应用正在退出')
+      if (options.authorizationProbe && this.browser.snapshot().queryReady)
+        throw new SkippedQuery('当前会话已验证，取消重复查询')
       if (options.valid && !options.valid()) throw new SkippedQuery('目标已移除或已更新')
       if (options.automatic && !this.canQueryAutomatically())
         throw new SkippedQuery('自动查询已暂停')
@@ -154,7 +189,10 @@ export class RecorderService {
     }
     const job = this.queue.then(async () => {
       validate()
-      if (Date.now() < this.rateUntil) throw new Error('网站请求过于频繁，稍后自动恢复')
+      if (Date.now() < this.rateUntil)
+        throw new BrowserQueryError('网站仍处于查询冷却期。', 'RATE_LIMITED', {
+          retryAt: new Date(this.rateUntil).toISOString()
+        })
       const gap = randomRequestGap(this.store.settings().requestIntervalMs, this.random)
       await delay(
         this.lastRequest ? Math.max(0, gap - (Date.now() - this.lastRequest)) : 0,
@@ -163,10 +201,14 @@ export class RecorderService {
       validate()
       if (options.automatic) this.authRecoveryRequested = false
       this.lastRequest = Date.now()
+      this.lastKeyword = keyword
       try {
         const result = await this.browser.search(keyword)
         if (options.valid && !options.valid()) throw new SkippedQuery('目标已移除或已更新')
         this.queryBlockKind = null
+        this.authRecoveryRequested = false
+        this.authVersion = this.browser.snapshot().authVersion ?? this.authVersion
+        this.queryError = null
         this.rateUntil = 0
         this.store.clearAccountErrors()
         this.store.account('ready')
@@ -177,25 +219,22 @@ export class RecorderService {
         return result
       } catch (error) {
         if (options.valid && !options.valid()) throw new SkippedQuery('目标已移除或已更新')
+        if (error instanceof BrowserQueryError && error.kind === 'SESSION_CHANGED')
+          throw new SkippedQuery('会话变化，等待重新查询')
+        this.queryError = toQueryIssue(error)
         if (
           error instanceof BrowserQueryError &&
-          ['AUTH', 'RESTRICTED', 'RATE_LIMITED'].includes(error.kind)
+          blockKinds.includes(error.kind as QueryBlockKind)
         ) {
           if (this.queryBlockKind !== error.kind)
-            this.sendNotice(
-              error.kind === 'AUTH' ? '小红书需要重新验证' : '网站限制了查询',
-              error.kind === 'AUTH'
-                ? '请打开后台查询页完成验证，正在录制的任务会继续'
-                : '已暂停自动查询，请稍后手动检查一个目标，成功后恢复监听',
-              null
-            )
+            this.sendNotice(error.issue.title, error.issue.help, null)
           this.queryBlockKind = error.kind as AppSnapshot['queryBlockKind']
           this.authRecoveryRequested = false
           this.blockVersion++
-          this.store.account(error.kind)
         }
         if (error instanceof BrowserQueryError && error.kind === 'RATE_LIMITED')
-          this.rateUntil = Date.now() + 60000
+          this.rateUntil = Math.max(Date.now() + 60000, Date.parse(error.issue.retryAt ?? '') || 0)
+        this.store.account(this.queryBlockKind ?? 'ready', this.queryError)
         throw error
       } finally {
         this.lastRequest = Date.now()
@@ -204,6 +243,24 @@ export class RecorderService {
     })
     this.queue = job.catch(() => undefined)
     return job
+  }
+  async retryQuery(targetId?: string): Promise<void> {
+    if (targetId) {
+      await this.check(targetId)
+      return
+    }
+    const target =
+      this.store.targets().find((t) => t.enabled && t.errorKind) ??
+      this.store.targets().find((t) => t.enabled)
+    if (target) {
+      await this.check(target.id)
+      return
+    }
+    if (this.lastKeyword) {
+      await this.search(this.lastKeyword)
+      return
+    }
+    throw new Error('请先输入小红书号或选择一个主播进行查询')
   }
   async profile(): Promise<Candidate[]> {
     const profile = await this.browser.currentProfile()
@@ -246,6 +303,10 @@ export class RecorderService {
         checkedAt: new Date().toISOString(),
         error: match.state === 'unknown' ? '网站未返回明确直播状态' : null,
         errorKind: match.state === 'unknown' ? 'UNKNOWN' : null,
+        queryError:
+          match.state === 'unknown'
+            ? new BrowserQueryError('网站未返回明确直播状态。', 'UNKNOWN').issue
+            : null,
         lastConfirmedAt:
           match.state === 'unknown' ? current.lastConfirmedAt : new Date().toISOString()
       }
@@ -279,6 +340,7 @@ export class RecorderService {
       if (!valid()) return
       const latest = this.requireTarget(id)
       if (
+        !this.paused &&
         (!automatic || this.canQueryAutomatically()) &&
         latest.enabled &&
         latest.autoRecord &&
@@ -295,7 +357,8 @@ export class RecorderService {
         ...current,
         checkedAt: new Date().toISOString(),
         error: error instanceof Error ? error.message : '查询失败',
-        errorKind: error instanceof BrowserQueryError ? error.kind : 'NETWORK'
+        errorKind: error instanceof BrowserQueryError ? error.kind : 'UNKNOWN',
+        queryError: toQueryIssue(error)
       })
       throw error
     } finally {

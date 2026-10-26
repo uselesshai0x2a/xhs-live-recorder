@@ -4,53 +4,48 @@ import { dirname } from 'node:path'
 import type { BrowserCandidate, BrowserEvidence, BrowserSnapshot } from '../../shared/browser'
 import {
   BrowserQueryError,
-  isOnebox,
   isVerificationPage,
   officialUrl,
   parseCandidates,
-  requestKeyword
+  responseError
 } from './protocol'
+import { abortable, SignerRuntime } from './signer-runtime'
+import { ONEBOX_API as API, queryTransport } from './query-transport'
 
-interface TrackedRequest {
-  keyword: string
-  status: number
-  signed: boolean
-  query: PendingQuery
-}
-interface NetworkEvent {
-  requestId: string
-  request?: { url: string; postData?: string; headers?: Record<string, string> }
-  response?: { status: number }
-}
-interface PendingQuery {
-  keyword: string
-  resolve: (candidates: BrowserCandidate[]) => void
-  reject: (error: Error) => void
-  timer: ReturnType<typeof setTimeout>
-}
+const HOME = 'https://www.xiaohongshu.com/explore'
+const credentialNames = new Set(['web_session', 'a1', 'webId'])
 
 export class XhsBrowserService {
   readonly session: Session
   readonly foreground: WebContentsView
-  readonly worker: WebContentsView
-  private readonly requests = new Map<string, TrackedRequest>()
-  private pending: PendingQuery | null = null
-  private showingWorker = false
+  private readonly signingView: WebContentsView
+  private readonly signer: SignerRuntime
+  private pending: AbortController | null = null
   private visible = true
   private hiddenMute = false
   private hidden = false
+  private htmlFullscreen = false
   private cookieTimer: ReturnType<typeof setInterval>
+  private cookieDebounce?: ReturnType<typeof setTimeout>
+  private cookieRead: Promise<void> = Promise.resolve()
   private disposed = false
-  private verificationRequired = false
-  private lastSessionValue = ''
+  private credentialVersion = 0
+  private lastCredentials: string | undefined
+  private verificationUrl: string | null = null
+  private wasVerifying = false
   private logQueue: Promise<void> = Promise.resolve()
   private state: BrowserSnapshot = {
+    authVersion: 0,
     cookieAvailable: false,
-    signedRequestObserved: false,
+    cookieExpiresAt: null,
+    queryReady: false,
+    signerStatus: 'idle',
     queryRunning: false,
     foregroundUrl: '',
     candidates: [],
-    evidence: []
+    evidence: [],
+    lastError: null,
+    focusMode: false
   }
 
   constructor(
@@ -59,8 +54,13 @@ export class XhsBrowserService {
     private readonly changed: (snapshot: BrowserSnapshot) => void
   ) {
     this.session = session.fromPartition('persist:xhs-account')
-    this.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
-    this.session.setPermissionCheckHandler(() => false)
+    this.session.setPermissionRequestHandler((contents, permission, callback) =>
+      callback(contents === this.foreground?.webContents && permission === 'fullscreen')
+    )
+    this.session.setPermissionCheckHandler(
+      (contents, permission) =>
+        contents === this.foreground?.webContents && permission === 'fullscreen'
+    )
     const create = (): WebContentsView =>
       new WebContentsView({
         webPreferences: {
@@ -69,134 +69,133 @@ export class XhsBrowserService {
           contextIsolation: true,
           sandbox: true,
           backgroundThrottling: false,
-          webSecurity: true
+          webSecurity: true,
+          disableHtmlFullscreenWindowResize: true
         }
       })
     this.foreground = create()
-    this.worker = create()
-    this.worker.webContents.setAudioMuted(true)
+    this.signingView = create()
+    this.signingView.webContents.setAudioMuted(true)
+    this.signingView.setVisible(false)
     this.secure(this.foreground.webContents)
-    this.secure(this.worker.webContents)
+    this.secure(this.signingView.webContents)
     window.contentView.addChildView(this.foreground)
-    window.contentView.addChildView(this.worker)
-    this.worker.setVisible(false)
+    // The signing WebContents is never attached to a visible window.
+    this.signer = new SignerRuntime(this.signingView.webContents, (status) => {
+      this.state.signerStatus = status
+      if (!this.disposed) this.changed(this.snapshot())
+    })
     this.foreground.webContents.on('did-navigate', () => this.foregroundNavigated())
     this.foreground.webContents.on('did-navigate-in-page', () => this.foregroundNavigated())
-    const inspectVerification = (): void => {
-      const required = isVerificationPage(this.worker.webContents.getURL())
-      if (required) {
-        if (!this.verificationRequired || this.pending)
-          this.fail(
-            '小红书要求账号安全验证，请打开后台查询页，用已登录的小红书 APP 扫码验证身份',
-            'AUTH'
-          )
-        this.verificationRequired = true
-      } else if (this.verificationRequired) {
-        this.verificationRequired = false
-        this.state.authVersion = (this.state.authVersion ?? 0) + 1
-        this.record('session', '后台已离开账号验证页，将重新检查授权状态')
-      }
-    }
-    this.worker.webContents.on('did-navigate', inspectVerification)
-    this.worker.webContents.on('did-navigate-in-page', inspectVerification)
-    this.worker.webContents.on('render-process-gone', () =>
-      this.fail('后台网页进程已退出，请重启应用')
-    )
-    this.worker.webContents.debugger.attach('1.3')
-    this.worker.webContents.debugger.on('message', (_event, method, params) => {
-      const query = this.pending
-      void this.networkEvent(method, params).catch((error: unknown) => {
-        if (query === this.pending)
-          this.fail(
-            error instanceof BrowserQueryError ? error.message : '无法读取网站响应，请重试查询',
-            error instanceof BrowserQueryError ? error.kind : 'SCHEMA'
-          )
-      })
+    this.foreground.webContents.on('enter-html-full-screen', () => {
+      this.htmlFullscreen = true
     })
-    this.worker.webContents.debugger.on('detach', () => {
-      if (!this.disposed) this.fail('后台请求观察已断开，请重启应用')
+    this.foreground.webContents.on('leave-html-full-screen', () => {
+      this.htmlFullscreen = false
     })
-    this.session.webRequest.onBeforeSendHeaders(
-      { urls: ['https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox*'] },
-      (details, callback) => {
-        // Inspect the presence of current credentials. Never persist or replay their values.
-        const signed = Object.entries(details.requestHeaders).some(
-          ([key, value]) => key.toLowerCase() === 'x-s' && Boolean(value)
-        )
-        if (signed && !this.state.signedRequestObserved) {
-          this.state.signedRequestObserved = true
-          this.record('session', '已观察到网站生成的签名请求（签名内容不保存）')
-        }
-        callback({ requestHeaders: details.requestHeaders })
-      }
-    )
+    this.foreground.webContents.on('before-input-event', this.escape)
+    window.webContents.on('before-input-event', this.escape)
+    this.signingView.webContents.on('render-process-gone', () => {
+      this.signer.reset()
+      this.pending?.abort(new BrowserQueryError('查询组件进程已退出，请修复后重试。', 'SIGNER'))
+    })
+    this.session.cookies.on('changed', this.cookieChanged)
     this.cookieTimer = setInterval(() => {
-      void this.refreshCookies()
+      void this.refreshCookies('periodic-check')
     }, 5000)
     this.cookieTimer.unref()
   }
 
-  async initialize(): Promise<void> {
-    await this.worker.webContents.loadURL('about:blank')
-    await this.worker.webContents.debugger.sendCommand('Network.enable', {
-      maxResourceBufferSize: 4 * 1024 * 1024,
-      maxTotalBufferSize: 8 * 1024 * 1024
-    })
-    await this.refreshCookies()
-    this.record('ready', '独立观看页与后台查询页已创建，共享持久化登录会话')
-    await this.open('https://www.xiaohongshu.com/explore')
+  private escape = (event: Electron.Event, input: Electron.Input): void => {
+    if (
+      input.type === 'keyDown' &&
+      input.key === 'Escape' &&
+      this.state.focusMode &&
+      !this.htmlFullscreen
+    ) {
+      event.preventDefault()
+      this.setFocusMode(false)
+    }
+  }
+  private cookieChanged = (
+    _event: Electron.Event,
+    cookie: Electron.Cookie,
+    cause: string,
+    removed: boolean
+  ): void => {
+    if (
+      this.disposed ||
+      !credentialNames.has(cookie.name) ||
+      !/(^|\.)xiaohongshu\.com$/.test(cookie.domain ?? '')
+    )
+      return
+    this.invalidateSession()
+    if (this.cookieDebounce) clearTimeout(this.cookieDebounce)
+    this.cookieDebounce = setTimeout(() => {
+      void this.refreshCookies(`${cookie.name}:${cause}:${removed ? 'removed' : 'updated'}`)
+    }, 300)
+  }
+  private invalidateSession(): void {
+    this.credentialVersion++
+    this.state.queryReady = false
+    this.state.candidates = []
+    this.signer.reset()
+    this.pending?.abort(new BrowserQueryError('登录会话已更新，旧查询已取消。', 'SESSION_CHANGED'))
   }
 
+  async initialize(): Promise<void> {
+    await this.refreshCookies('startup')
+    this.record('ready', '观看与接口查询共用持久化登录会话；签名环境按需初始化')
+    await this.open(HOME)
+  }
   snapshot(): BrowserSnapshot {
     return structuredClone(this.state)
   }
-
   async open(url: string): Promise<void> {
     await this.foreground.webContents.loadURL(officialUrl(url))
-    this.showQueryPage(false)
   }
-
-  showQueryPage(show: boolean): void {
-    this.showingWorker = show
-    this.worker.setVisible(this.visible && show)
-    this.foreground.setVisible(this.visible && !show)
+  async openRecoveryPage(): Promise<void> {
+    this.setFocusMode(false)
+    await this.open(this.verificationUrl ?? HOME)
   }
-
+  resetSigner(): void {
+    this.signer.reset()
+    this.state.queryReady = false
+    this.changed(this.snapshot())
+  }
+  setFocusMode(focused: boolean): void {
+    this.state.focusMode = focused && this.visible
+    this.changed(this.snapshot())
+  }
   setVisible(visible: boolean): void {
     this.visible = visible
-    this.foreground.setVisible(visible && !this.showingWorker)
-    this.worker.setVisible(visible && this.showingWorker)
+    this.foreground.setVisible(visible)
+    if (!visible) this.setFocusMode(false)
   }
-
   async currentProfile(): Promise<{ keyWord: string; userId: string | null; name: string }> {
     const url = this.foreground.webContents.getURL()
     officialUrl(url)
     const userId = new URL(url).pathname.match(/^\/user\/profile\/([a-zA-Z0-9]+)\/?$/)?.[1] ?? null
     if (!userId) throw new Error('请先在网页中打开需要监听的主播主页')
     const data = await this.foreground.webContents.executeJavaScript(`(() => {
-      const text = document.body.innerText;
-      const keyWord = text.match(/小红书号[：:\\s]+([a-zA-Z0-9_-]+)/)?.[1] || '';
+      const keyWord = document.body.innerText.match(/小红书号[：:\\s]+([a-zA-Z0-9_-]+)/)?.[1] || '';
       return {keyWord, name: document.querySelector('.user-name')?.textContent?.trim() || document.title.split(' - ')[0]};
     })()`)
     if (typeof data.keyWord !== 'string' || !data.keyWord)
       throw new Error('网页未显示小红书号，请手动输入后确认用户')
     return { keyWord: data.keyWord, userId, name: String(data.name ?? '') }
   }
-
   setBounds(bounds: { x: number; y: number; width: number; height: number }): void {
     const [width, height] = this.window.getContentSize()
     const x = Math.max(0, Math.min(width, Math.round(bounds.x)))
     const y = Math.max(0, Math.min(height, Math.round(bounds.y)))
-    const safe = {
+    this.foreground.setBounds({
       x,
       y,
       width: Math.max(0, Math.min(width - x, Math.round(bounds.width))),
       height: Math.max(0, Math.min(height - y, Math.round(bounds.height)))
-    }
-    this.foreground.setBounds(safe)
-    this.worker.setBounds(safe)
+    })
   }
-
   setHidden(hidden: boolean): void {
     if (hidden === this.hidden) return
     this.hidden = hidden
@@ -204,184 +203,213 @@ export class XhsBrowserService {
       this.hiddenMute = this.foreground.webContents.isAudioMuted()
       this.foreground.webContents.setAudioMuted(true)
     } else this.foreground.webContents.setAudioMuted(this.hiddenMute)
-    this.record('visibility', hidden ? '主窗口已隐藏，后台查询继续，观看页静音' : '主窗口已恢复')
+    this.record('visibility', hidden ? '窗口已隐藏，接口查询继续，观看页静音' : '主窗口已恢复')
   }
 
   async search(value: string): Promise<BrowserCandidate[]> {
     const keyword = value.trim()
     if (!keyword || keyword.length > 100) throw new Error('请输入 1–100 个字符的小红书号或用户名')
+    if (this.disposed) throw new Error('应用正在退出')
     if (this.pending) throw new Error('正在查询，请等待当前查询完成')
-    if (isVerificationPage(this.worker.webContents.getURL()))
-      throw new BrowserQueryError(
-        '小红书要求账号安全验证，请打开后台查询页，用已登录的小红书 APP 扫码验证身份',
-        'AUTH'
-      )
-    this.requests.clear()
+    const controller = new AbortController()
+    this.pending = controller
+    const version = this.credentialVersion
+    const timer = setTimeout(
+      () =>
+        controller.abort(new BrowserQueryError('等待接口响应超时，请检查网络后重试。', 'TIMEOUT')),
+      45000
+    )
     this.state.queryRunning = true
-    this.record('query', `后台查询：${keyword}`)
-    const completion = new Promise<BrowserCandidate[]>((resolve, reject) => {
-      const timer = setTimeout(
-        () => this.fail('等待网站搜索响应超时，请查看后台查询页是否需要登录或验证'),
-        45000
-      )
-      this.pending = { keyword, resolve, reject, timer }
-    })
-    // A navigation invokes the site's real search flow; no fabricated signatures or raw API replay.
-    const searchUrl = `https://www.xiaohongshu.com/search_result/?keyword=${encodeURIComponent(keyword)}&source=web_explore_feed`
-    const query = this.pending
-    void this.worker.webContents.loadURL(searchUrl).catch(() => {
-      if (query === this.pending) this.fail('后台搜索页面加载失败，请检查网络或查看后台查询页')
-    })
-    return completion
-  }
-
-  private async refreshCookies(): Promise<void> {
-    if (this.disposed) return
+    this.record('query', '开始接口查询')
     try {
-      const cookies = await this.session.cookies.get({ url: 'https://www.xiaohongshu.com' })
-      const available = cookies.some(
-        (cookie) => cookie.name === 'web_session' && cookie.value.length > 0
-      )
-      const sessionValue = cookies.find((cookie) => cookie.name === 'web_session')?.value ?? ''
-      if (sessionValue !== this.lastSessionValue) {
-        this.lastSessionValue = sessionValue
-        this.state.authVersion = (this.state.authVersion ?? 0) + 1
-        this.changed(this.snapshot())
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const signed = await abortable(
+            this.signer.sign(keyword, controller.signal),
+            controller.signal
+          )
+          const response = await abortable(
+            queryTransport(this.session, signed, controller.signal),
+            controller.signal
+          )
+          if (response.status >= 300 && response.status < 400) {
+            const location = response.headers.get('location')
+            if (location) {
+              try {
+                const url = officialUrl(new URL(location, API).href)
+                if (isVerificationPage(url)) {
+                  this.verificationUrl = url
+                  throw new BrowserQueryError('网站要求完成安全验证。', 'VERIFICATION', {
+                    httpStatus: response.status
+                  })
+                }
+              } catch (e) {
+                if (e instanceof BrowserQueryError) throw e
+              }
+            }
+            throw new BrowserQueryError('接口返回了未预期的跳转，已停止查询。', 'RESTRICTED', {
+              httpStatus: response.status
+            })
+          }
+          const raw = await abortable(response.text(), controller.signal)
+          let payload: unknown = null
+          try {
+            payload = JSON.parse(raw)
+          } catch {
+            /* HTTP errors may be HTML. */
+          }
+          const failure = responseError(
+            response.status,
+            payload,
+            response.headers.get('retry-after'),
+            Date.now(),
+            [keyword]
+          )
+          if (failure) throw failure
+          const candidates = parseCandidates(payload, keyword)
+          if (controller.signal.aborted) throw controller.signal.reason
+          if (version !== this.credentialVersion)
+            throw new BrowserQueryError('登录会话已更新，旧响应已丢弃。', 'SESSION_CHANGED')
+          this.state.candidates = candidates
+          this.state.queryReady = true
+          this.state.lastError = null
+          this.verificationUrl = null
+          this.record('response', `接口查询成功：${candidates.length} 个用户结果`)
+          return candidates
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason
+          if (
+            attempt === 0 &&
+            error instanceof BrowserQueryError &&
+            ['SIGNATURE', 'SIGNER'].includes(error.kind)
+          ) {
+            this.signer.reset()
+            continue
+          }
+          throw error
+        }
       }
-      if (available !== this.state.cookieAvailable) {
-        this.state.cookieAvailable = available
-        this.record(
-          'session',
-          available
-            ? '浏览器会话 Cookie 已存在；有效登录仍需真实查询确认'
-            : '未检测到登录会话，请在网页内登录'
+      throw new BrowserQueryError('查询组件未返回结果。', 'SIGNER')
+    } catch (error) {
+      const failure = controller.signal.aborted
+        ? controller.signal.reason
+        : error instanceof BrowserQueryError
+          ? error
+          : new BrowserQueryError('无法连接查询接口，请检查网络或代理设置。', 'NETWORK', {
+              diagnostic:
+                error instanceof Error
+                  ? error.message.match(/(?:net::)?ERR_[A-Z_]+/)?.[0]
+                  : undefined
+            })
+      this.state.queryReady = false
+      if (failure instanceof BrowserQueryError && failure.kind !== 'SESSION_CHANGED') {
+        this.state.lastError = failure.issue
+        if (
+          failure.kind === 'VERIFICATION' &&
+          isVerificationPage(this.signingView.webContents.getURL())
         )
+          this.verificationUrl = this.signingView.webContents.getURL()
+        this.record('error', `${failure.issue.id} ${failure.issue.title}：${failure.message}`)
       }
-    } catch {
-      /* A closing session cannot be queried. */
+      throw failure
+    } finally {
+      clearTimeout(timer)
+      if (this.pending === controller) this.pending = null
+      this.state.queryRunning = false
+      if (!this.disposed) this.changed(this.snapshot())
     }
   }
 
+  private refreshCookies(reason: string): Promise<void> {
+    this.cookieRead = this.cookieRead
+      .then(async () => {
+        if (this.disposed) return
+        const cookies = await this.session.cookies.get({ url: 'https://www.xiaohongshu.com' })
+        const token = cookies
+          .filter((c) => credentialNames.has(c.name))
+          .map((c) => `${c.name}:${c.domain}:${c.path}:${c.value}:${c.expirationDate ?? ''}`)
+          .sort()
+          .join('\n')
+        const login = cookies.find((c) => c.name === 'web_session' && c.value)
+        this.state.cookieAvailable = Boolean(login)
+        this.state.cookieExpiresAt = login?.expirationDate
+          ? new Date(login.expirationDate * 1000).toISOString()
+          : null
+        if (token !== this.lastCredentials) {
+          if (this.lastCredentials !== undefined) this.invalidateSession()
+          this.lastCredentials = token
+          this.state.authVersion = (this.state.authVersion ?? 0) + 1
+          this.record(
+            'session',
+            `会话状态变化：${reason}；Cookie ${login ? '存在' : '缺失'}；到期时间 ${this.state.cookieExpiresAt ?? '会话级或未知'}`
+          )
+          await this.session.cookies.flushStore()
+          this.session.flushStorageData()
+        }
+      })
+      .catch(() => {
+        /* Shutdown or storage unavailability must not become an unhandled rejection. */
+      })
+    return this.cookieRead
+  }
   private secure(contents: WebContents): void {
     contents.setWindowOpenHandler(({ url }) => {
       try {
         void contents.loadURL(officialUrl(url)).catch(() => undefined)
       } catch {
-        /* Reject unrelated sites and protocols. */
+        /* Reject non-official pages. */
       }
       return { action: 'deny' }
     })
-    const guard = (navigation: Electron.Event, url: string): void => {
+    const guard = (event: Electron.Event, url: string): void => {
       try {
         officialUrl(url)
       } catch {
-        navigation.preventDefault()
+        event.preventDefault()
       }
     }
     contents.on('will-navigate', guard)
     contents.on('will-redirect', guard)
     contents.on('will-attach-webview', (event) => event.preventDefault())
   }
-
   private foregroundNavigated(): void {
     this.state.foregroundUrl = this.foreground.webContents.getURL()
+    const verifying = isVerificationPage(this.state.foregroundUrl)
+    if (verifying) this.verificationUrl = this.state.foregroundUrl
+    else if (this.wasVerifying) {
+      this.invalidateSession()
+      this.state.authVersion = (this.state.authVersion ?? 0) + 1
+      this.verificationUrl = null
+    }
+    this.wasVerifying = verifying
     this.changed(this.snapshot())
   }
-
-  // CDP is scoped to the worker WebContents. Bodies never leave the main process.
-  private async networkEvent(method: string, params: NetworkEvent): Promise<void> {
-    if (
-      method === 'Network.requestWillBeSent' &&
-      params.request &&
-      isOnebox(params.request.url) &&
-      this.pending
-    ) {
-      const keyword = requestKeyword(params.request.postData)
-      if (keyword !== this.pending.keyword) return
-      const signed = Object.keys(params.request.headers ?? {}).some(
-        (key) => key.toLowerCase() === 'x-s'
-      )
-      this.requests.set(params.requestId, { keyword, status: 0, signed, query: this.pending })
-    }
-    const tracked = this.requests.get(params.requestId)
-    if (!tracked) return
-    if (tracked.query !== this.pending) return
-    if (method === 'Network.responseReceived' && params.response)
-      tracked.status = params.response.status
-    if (method === 'Network.loadingFailed') {
-      this.requests.delete(params.requestId)
-      this.fail('网站搜索请求未完成，请检查登录和网络')
-    }
-    if (method !== 'Network.loadingFinished') return
-    this.requests.delete(params.requestId)
-    const pending = this.pending
-    if (!pending || pending.keyword !== tracked.keyword) return
-    if (tracked.status !== 200) {
-      this.fail(
-        `网站搜索返回 HTTP ${tracked.status}，请查看后台查询页`,
-        tracked.status === 461
-          ? 'RESTRICTED'
-          : tracked.status === 429
-            ? 'RATE_LIMITED'
-            : [401, 403, 406].includes(tracked.status)
-              ? 'AUTH'
-              : 'NETWORK'
-      )
-      return
-    }
-    const response = await this.worker.webContents.debugger.sendCommand('Network.getResponseBody', {
-      requestId: params.requestId
-    })
-    if (this.pending !== pending) return
-    const body = response.base64Encoded
-      ? Buffer.from(response.body, 'base64').toString('utf8')
-      : response.body
-    const candidates = parseCandidates(JSON.parse(body), tracked.keyword)
-    clearTimeout(pending.timer)
-    this.pending = null
-    this.state.queryRunning = false
-    this.state.candidates = candidates
-    this.record(
-      'response',
-      `真实查询完成：${tracked.keyword}；${candidates.length} 个用户结果；窗口${this.hidden ? '隐藏' : '可见'}`
-    )
-    pending.resolve(candidates)
-  }
-
-  private fail(message: string, kind: BrowserQueryError['kind'] = 'NETWORK'): void {
-    const pending = this.pending
-    if (pending) clearTimeout(pending.timer)
-    this.pending = null
-    this.state.queryRunning = false
-    this.record('error', message)
-    pending?.reject(new BrowserQueryError(message, kind))
-  }
-
   private record(kind: BrowserEvidence['kind'], message: string): void {
+    // Callers supply fixed application text or an already-redacted QueryIssue.
+    // Preserve the generated diagnostic UUID so the user can correlate records.
     const evidence = { at: new Date().toISOString(), kind, message }
     this.state.evidence = [...this.state.evidence.slice(-79), evidence]
     this.logQueue = this.logQueue
       .then(async () => {
         await mkdir(dirname(this.logPath), { recursive: true })
-        await appendFile(
-          this.logPath,
-          `${evidence.at} [${kind}] ${message.replace(/[\r\n]/g, ' ')}\n`,
-          'utf8'
-        )
+        await appendFile(this.logPath, `${evidence.at} [${kind}] ${evidence.message}\n`, 'utf8')
       })
       .catch(() => undefined)
     if (!this.disposed) this.changed(this.snapshot())
   }
-
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
     clearInterval(this.cookieTimer)
-    this.fail('应用已退出')
-    this.session.webRequest.onBeforeSendHeaders(null)
+    clearTimeout(this.cookieDebounce)
+    this.session.cookies.removeListener('changed', this.cookieChanged)
+    this.window.webContents.removeListener('before-input-event', this.escape)
+    this.pending?.abort(new BrowserQueryError('应用正在退出，查询已取消。', 'SESSION_CHANGED'))
     this.foreground.webContents.close()
-    this.worker.webContents.close()
+    this.signingView.webContents.close()
+    await this.cookieRead
     await this.session.cookies.flushStore()
+    this.session.flushStorageData()
     await this.logQueue
   }
 }

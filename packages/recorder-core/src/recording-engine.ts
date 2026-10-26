@@ -31,6 +31,7 @@ interface Active {
   timer?: ReturnType<typeof setTimeout>;
   stopReason: RecordingRun["stopReason"];
   streamEnded?: boolean;
+  mergeAbort?: AbortController;
 }
 
 export class RecordingEngine {
@@ -115,9 +116,18 @@ export class RecordingEngine {
   ): Promise<void> {
     const active = this.active.get(targetId);
     if (!active) return;
+    // An offline observation ends capture, never the post-processing of it.
+    if (reason === "offline" && (active.streamEnded || active.mergeAbort)) {
+      await active.done;
+      return;
+    }
     active.stopReason = reason;
     if (reason === "removed") active.config.keepSegments = true;
     active.run.stopReason = reason;
+    if (active.mergeAbort) {
+      active.mergeAbort.abort();
+      active.run.message = "合并未完成，原分片已保留";
+    }
     active.abort.abort();
     this.update(active, "stopping");
     this.stopProcess(active);
@@ -357,6 +367,10 @@ export class RecordingEngine {
     segments: RecordingFile[],
   ): Promise<void> {
     const { run, config } = active;
+    // Capture may already have been stopped deliberately; merging has its own
+    // cancellation lifetime, including the asynchronous preparation steps.
+    const mergeAbort = active.mergeAbort ?? new AbortController();
+    active.mergeAbort = mergeAbort;
     const disk = await this.disk.probe(run.directory, this.repo.settings());
     const needed =
       segments.reduce((sum, file) => sum + file.bytes, 0) +
@@ -366,7 +380,11 @@ export class RecordingEngine {
       this.repo.saveRun(run);
       return;
     }
-    if (active.stopReason === "exit" || active.stopReason === "disk") return;
+    if (
+      mergeAbort.signal.aborted ||
+      ["exit", "disk", "output"].includes(active.stopReason ?? "")
+    )
+      return;
     this.update(active, "merging");
     const destination = path.join(
       run.directory,
@@ -386,6 +404,7 @@ export class RecordingEngine {
           .join("\n"),
         "utf8",
       );
+      if (mergeAbort.signal.aborted) return;
       active.process = this.runner.start([
         "-hide_banner",
         "-loglevel",
@@ -406,18 +425,16 @@ export class RecordingEngine {
       const exit = await active.process.completion;
       active.process = null;
       if (active.timer) clearTimeout(active.timer);
-      if (
-        exit.code !== 0 ||
-        ["exit", "disk", "removed"].includes(active.stopReason ?? "")
-      ) {
+      if (exit.code !== 0 || mergeAbort.signal.aborted) {
         run.message = "合并未完成，原分片已保留";
         return;
       }
     }
+    if (mergeAbort.signal.aborted) return;
     await rename(temporary, destination);
     run.outputPath = destination;
     run.mergeState = "completed";
-    if (!config.keepSegments) {
+    if (!config.keepSegments && !mergeAbort.signal.aborted) {
       // Delete only the indexed fragments of this run, never a user-selected directory.
       for (const file of segments) {
         try {
@@ -445,6 +462,7 @@ export class RecordingEngine {
       process: null,
       done: Promise.resolve(),
       stopReason: null,
+      mergeAbort: new AbortController(),
     };
     this.active.set(run.targetId, active);
     active.done = (async () => {

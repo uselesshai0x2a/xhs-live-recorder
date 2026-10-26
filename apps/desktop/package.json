@@ -1,6 +1,6 @@
 {
   "name": "apps-desktop",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "小红书直播监听与静默录制桌面应用",
   "main": "./out/main/index.js",
   "author": "XHS Live Recorder contributors",

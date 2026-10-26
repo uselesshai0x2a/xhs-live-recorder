@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -74,7 +74,234 @@ async function fixture() {
   };
   return { root, settings, target, repo, disk, runs, fileMap };
 }
+
+function controlledMergeRunner() {
+  let finish!: () => void;
+  let started = false;
+  const runner: MediaRunner = {
+    start(args) {
+      const output = args[args.length - 1];
+      if (!args.includes("concat")) {
+        return {
+          completion: Promise.all([
+            writeFile(output.replace("%05d", "00000"), "first"),
+            writeFile(output.replace("%05d", "00001"), "second"),
+          ]).then(() => ({ code: 0, stderr: "" })),
+          quit() {},
+          kill() {},
+        };
+      }
+      started = true;
+      let quit!: () => void;
+      const completion = new Promise<{ code: number; stderr: string }>(
+        (resolve) => {
+          let finished = false;
+          const settle = (content: string) => {
+            if (finished) return;
+            finished = true;
+            void writeFile(output, content).then(() =>
+              resolve({ code: 0, stderr: "" }),
+            );
+          };
+          finish = () => settle("firstsecond");
+          quit = () => settle("first");
+        },
+      );
+      return { completion, quit: () => quit(), kill: () => quit() };
+    },
+  };
+  return { runner, started: () => started, finish: () => finish() };
+}
 describe("recording safeguards", () => {
+  it.each(["manual", "removed"] as const)(
+    "keeps fragments when %s cancels a retry merge during file indexing",
+    async (reason) => {
+      const f = await fixture();
+      f.settings.autoMerge = false;
+      const media = controlledMergeRunner();
+      const engine = new RecordingEngine(
+        f.repo,
+        media.runner,
+        f.disk,
+        () => {},
+      );
+      const run = engine.start(f.target);
+      await vi.waitFor(() => expect(engine.activeRuns).toHaveLength(0));
+      f.settings.autoMerge = true;
+      let release!: () => void;
+      let indexing = false;
+      const indexFiles = engine.indexFiles.bind(engine);
+      vi.spyOn(engine, "indexFiles").mockImplementationOnce(
+        async (recording) => {
+          indexing = true;
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          return indexFiles(recording);
+        },
+      );
+      const merge = engine.merge(run.id);
+      await vi.waitFor(() => expect(indexing).toBe(true));
+      const stopped = engine.stop(f.target.id, reason);
+      release();
+      await vi.waitFor(() => {
+        if (media.started()) media.finish();
+        expect(engine.activeRuns).toHaveLength(0);
+      });
+      await Promise.all([merge, stopped]);
+      expect(media.started()).toBe(false);
+      expect(f.repo.run(run.id)).toMatchObject({ outputPath: null });
+      expect(
+        f.repo.files(run.id).filter((file) => file.kind === "segment"),
+      ).toHaveLength(2);
+    },
+  );
+  it("still merges all captured fragments after a manual stop during recording", async () => {
+    const f = await fixture();
+    const media = controlledMergeRunner();
+    const runner: MediaRunner = {
+      start(args) {
+        const process = media.runner.start(args);
+        if (args.includes("concat")) return process;
+        let finish!: () => void;
+        const stopped = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return {
+          completion: process.completion.then(async (exit) => {
+            await stopped;
+            return exit;
+          }),
+          quit: () => finish(),
+          kill: () => finish(),
+        };
+      },
+    };
+    const engine = new RecordingEngine(f.repo, runner, f.disk, () => {});
+    const run = engine.start(f.target);
+    await vi.waitFor(() => expect(f.repo.run(run.id)?.state).toBe("recording"));
+    const stopped = engine.stop(f.target.id, "manual");
+    await vi.waitFor(() => expect(media.started()).toBe(true));
+    media.finish();
+    await stopped;
+    const saved = f.repo.run(run.id);
+    expect(saved).toMatchObject({
+      state: "stopped",
+      mergeState: "completed",
+      stopReason: "manual",
+    });
+    expect(await readFile(saved?.outputPath ?? "", "utf8")).toBe("firstsecond");
+  });
+  it("finishes the whole merge when an offline query arrives during merging", async () => {
+    const f = await fixture();
+    const media = controlledMergeRunner();
+    const engine = new RecordingEngine(f.repo, media.runner, f.disk, () => {});
+    const run = engine.start(f.target);
+    await vi.waitFor(() => expect(media.started()).toBe(true));
+    const stop = engine.stop(f.target.id, "offline");
+    media.finish();
+    await stop;
+    await vi.waitFor(() => expect(engine.activeRuns).toHaveLength(0));
+    const saved = f.repo.run(run.id);
+    expect(saved).toMatchObject({
+      state: "completed",
+      mergeState: "completed",
+      stopReason: null,
+    });
+    expect(await readFile(saved?.outputPath ?? "", "utf8")).toBe("firstsecond");
+  });
+  it.each(["manual", "removed", "exit", "disk"] as const)(
+    "keeps all original fragments when %s cancels a merge with exit code zero",
+    async (reason) => {
+      const f = await fixture();
+      const media = controlledMergeRunner();
+      const engine = new RecordingEngine(
+        f.repo,
+        media.runner,
+        f.disk,
+        () => {},
+      );
+      const run = engine.start(f.target);
+      await vi.waitFor(() => expect(media.started()).toBe(true));
+      await engine.stop(f.target.id, reason);
+      const saved = f.repo.run(run.id);
+      expect(saved).toMatchObject({
+        mergeState: "pending",
+        outputPath: null,
+        stopReason: reason,
+      });
+      const segments = f.repo
+        .files(run.id)
+        .filter((file) => file.kind === "segment");
+      expect(segments).toHaveLength(2);
+      expect(
+        await Promise.all(segments.map((file) => readFile(file.path, "utf8"))),
+      ).toEqual(["first", "second"]);
+    },
+  );
+  it.each(["offline", "manual", "exit"] as const)(
+    "handles %s while a finished recording is waiting for the merge disk probe",
+    async (reason) => {
+      const f = await fixture();
+      const media = controlledMergeRunner();
+      let release!: () => void;
+      let probing = false;
+      vi.mocked(f.disk.probe).mockImplementation(async (directory) => {
+        if (directory !== f.root) {
+          probing = true;
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+        return probeResult(directory);
+      });
+      function probeResult(directory: string) {
+        return {
+          directory,
+          freeBytes: 50 * GiB,
+          totalBytes: 100 * GiB,
+          level: "ok" as const,
+          message: null,
+        };
+      }
+      const engine = new RecordingEngine(
+        f.repo,
+        media.runner,
+        f.disk,
+        () => {},
+      );
+      const run = engine.start(f.target);
+      await vi.waitFor(() => expect(probing).toBe(true));
+      const stopped = engine.stop(f.target.id, reason);
+      release();
+      // Complete any unexpectedly spawned merge too, so a regression cannot hang the test.
+      await vi.waitFor(() => {
+        if (media.started()) media.finish();
+        expect(engine.activeRuns).toHaveLength(0);
+      });
+      await stopped;
+      const saved = f.repo.run(run.id);
+      if (reason === "offline") {
+        expect(saved).toMatchObject({
+          state: "completed",
+          mergeState: "completed",
+          stopReason: null,
+        });
+        expect(await readFile(saved?.outputPath ?? "", "utf8")).toBe(
+          "firstsecond",
+        );
+      } else {
+        expect(media.started()).toBe(false);
+        expect(saved).toMatchObject({
+          mergeState: "pending",
+          outputPath: null,
+        });
+        expect(
+          f.repo.files(run.id).filter((file) => file.kind === "segment"),
+        ).toHaveLength(2);
+      }
+    },
+  );
   it("emits a natural stream end once before finishing the run", async () => {
     const f = await fixture();
     f.settings.autoMerge = false;
