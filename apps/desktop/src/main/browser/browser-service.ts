@@ -336,9 +336,13 @@ export class XhsBrowserService {
           ? new Date(login.expirationDate * 1000).toISOString()
           : null
         if (token !== this.lastCredentials) {
-          if (this.lastCredentials !== undefined) this.invalidateSession()
+          // Loading the persisted session establishes a baseline; only a later
+          // credential change may request recovery of a blocked account.
+          if (this.lastCredentials !== undefined) {
+            this.invalidateSession()
+            this.state.authVersion = (this.state.authVersion ?? 0) + 1
+          }
           this.lastCredentials = token
-          this.state.authVersion = (this.state.authVersion ?? 0) + 1
           this.record(
             'session',
             `会话状态变化：${reason}；Cookie ${login ? '存在' : '缺失'}；到期时间 ${this.state.cookieExpiresAt ?? '会话级或未知'}`

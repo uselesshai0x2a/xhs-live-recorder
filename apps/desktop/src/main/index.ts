@@ -225,9 +225,9 @@ async function start(): Promise<void> {
       return
     }
     if (action === 'repair') browser!.resetSigner()
-    await service!.retryQuery(targetId as string | undefined)
+    return service!.retryQuery(targetId as string | undefined)
   })
-  handle('app:search', (value) => service!.search(string(value)))
+  handle('app:search', (value) => service!.search(string(value), { interactive: true }))
   handle('app:profile', () => service!.profile())
   handle('app:remove', (value) => service!.remove(string(value)))
   handle('app:add', (value) => service!.add(string(value)))
@@ -293,7 +293,7 @@ async function start(): Promise<void> {
     await browser!.open(string(value))
     browser!.setVisible(page === 'browser')
   })
-  handle('browser:search', (value) => service!.search(string(value)))
+  handle('browser:search', (value) => service!.search(string(value), { interactive: true }))
   handle('browser:focus', (value) => {
     if (typeof value !== 'boolean') throw new Error('无效观看模式')
     browser!.setFocusMode(value && page === 'browser')

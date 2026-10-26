@@ -162,7 +162,13 @@ async function choose(): Promise<void> {
   })
 }
 async function recoverQuery(recovery: QueryRecoveryAction, targetId?: string): Promise<void> {
-  await action(() => api.recoverQuery(recovery, targetId))
+  await action(async () => {
+    const result = await api.recoverQuery(recovery, targetId)
+    if (result) {
+      candidates.value = result
+      await setPage('targets')
+    }
+  })
 }
 async function copyDiagnostic(id: string): Promise<void> {
   try {
@@ -204,6 +210,18 @@ watch(focusMode, async () => {
   await nextTick()
   resize()
 })
+watch(
+  [
+    () => snapshot.value?.candidateSearch?.id,
+    () => snapshot.value?.candidateSearch?.candidates !== null
+  ],
+  ([id]) => {
+    if (id === undefined) return
+    const result = snapshot.value?.candidateSearch?.candidates
+    candidates.value = result ?? []
+    if (result) void setPage('targets')
+  }
+)
 watch(
   () => snapshot.value?.browser.queryReady,
   (ready) => {

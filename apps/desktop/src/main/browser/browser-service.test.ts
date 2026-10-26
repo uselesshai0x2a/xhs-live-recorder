@@ -103,6 +103,9 @@ vi.mock('electron', async () => {
   }
 })
 import { XhsBrowserService } from './browser-service'
+import { RecorderService } from '../recorder-service'
+import type { SqliteStore } from '../store'
+import { defaultSettings } from '@xhs-live-recorder/core'
 let service: XhsBrowserService
 beforeEach(async () => {
   vi.useFakeTimers()
@@ -132,6 +135,67 @@ afterEach(async () => {
   f.session.cookies.removeAllListeners()
 })
 describe('direct browser-session queries', () => {
+  it('treats the first cookie read as a baseline rather than a login change', async () => {
+    expect(service.snapshot().cookieAvailable).toBe(true)
+    expect(service.snapshot().authVersion).toBe(0)
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(service.snapshot().authVersion).toBe(0)
+    expect(f.fetch).not.toHaveBeenCalled()
+  })
+  it.each(['RESTRICTED', 'SIGNER', 'SCHEMA'])(
+    'keeps persisted %s blocked on startup, then validates an actual login change once',
+    async (kind) => {
+      await service.dispose()
+      const { EventEmitter } = await import('node:events')
+      const win = {
+        contentView: { addChildView: vi.fn() },
+        getContentSize: () => [1200, 800],
+        webContents: new EventEmitter()
+      }
+      service = new XhsBrowserService(win as unknown as BrowserWindow, 'test/browser.log', vi.fn())
+      const store = {
+        accountStatus: () => kind,
+        queryIssue: () => null,
+        targets: () => [{ id: 'target', keyWord: 'alice', enabled: true }],
+        settings: () => defaultSettings('unused'),
+        clearAccountErrors: vi.fn(),
+        account: vi.fn()
+      } as unknown as SqliteStore
+      const coordinator = new RecorderService(store, service, 'unused', vi.fn(), vi.fn())
+      coordinator.setPaused(true)
+      const recording = vi.spyOn(coordinator.engine, 'start')
+      vi.spyOn(coordinator.disk, 'probe').mockResolvedValue({
+        directory: 'unused',
+        totalBytes: 100,
+        freeBytes: 100,
+        level: 'ok',
+        message: null
+      })
+      try {
+        await service.initialize()
+        coordinator.start()
+        await vi.advanceTimersByTimeAsync(12000)
+        expect(f.fetch).not.toHaveBeenCalled()
+        expect(coordinator.queryBlockKind).toBe(kind)
+        f.cookies[0].expirationDate = 2000000300
+        f.session.cookies.emit(
+          'changed',
+          {},
+          { name: 'web_session', domain: '.xiaohongshu.com' },
+          'explicit',
+          false
+        )
+        await vi.advanceTimersByTimeAsync(12000)
+        expect(f.fetch).toHaveBeenCalledOnce()
+        expect(coordinator.queryBlockKind).toBeNull()
+        expect(recording).not.toHaveBeenCalled()
+      } finally {
+        const closing = coordinator.close()
+        await vi.advanceTimersByTimeAsync(2000)
+        await closing
+      }
+    }
+  )
   it('detects cookie renewal without changing its value and retains diagnostic IDs', async () => {
     const previous = service.snapshot().authVersion
     f.cookies[0].expirationDate = 2000000300

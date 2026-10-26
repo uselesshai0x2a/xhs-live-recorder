@@ -28,6 +28,12 @@ const blockKinds: QueryBlockKind[] = [
 
 class SkippedQuery extends Error {}
 
+function matchingCandidates(candidates: Candidate[], userId?: string | null): Candidate[] {
+  return userId === undefined
+    ? candidates
+    : candidates.filter((candidate) => candidate.userId === userId)
+}
+
 export class RecorderService {
   readonly engine: RecordingEngine
   readonly disk = new FileSystemDisk()
@@ -35,6 +41,10 @@ export class RecorderService {
   queryBlockKind: AppSnapshot['queryBlockKind'] = null
   queryError: QueryIssue | null = null
   private lastKeyword: string | null = null
+  private candidateSearch: AppSnapshot['candidateSearch'] = null
+  private candidateSearchId = 0
+  private pendingCandidateSearch: { id: number; keyword: string; userId?: string | null } | null =
+    null
   get authBlocked(): boolean {
     return this.queryBlockKind !== null
   }
@@ -100,6 +110,7 @@ export class RecorderService {
       queryBlockKind: this.queryBlockKind,
       queryError: this.queryError,
       pendingConfirmations: [...this.pendingConfirmations.keys()],
+      candidateSearch: this.candidateSearch,
       browser: this.browser.snapshot()
     }
   }
@@ -117,13 +128,19 @@ export class RecorderService {
       const version = authorization.authVersion ?? 0
       if (version !== this.authVersion) {
         this.authVersion = version
-        if (!authorization.queryReady && (this.lastKeyword || this.store.targets().length))
+        if (
+          !authorization.queryReady &&
+          (this.pendingCandidateSearch || this.lastKeyword || this.store.targets().length)
+        )
           this.authRecoveryRequested = true
       }
       // Login validation is a read-only probe, including before the first target
       // is added or while monitoring is paused. It cannot start a recording.
       if (this.authRecoveryRequested && Date.now() >= this.rateUntil) {
-        const keyword = this.lastKeyword ?? this.store.targets()[0]?.keyWord
+        const keyword =
+          this.pendingCandidateSearch?.keyword ??
+          this.lastKeyword ??
+          this.store.targets()[0]?.keyWord
         this.authRecoveryRequested = false
         if (keyword) await this.search(keyword, { authorizationProbe: true }).catch(() => undefined)
       }
@@ -174,12 +191,33 @@ export class RecorderService {
   }
   search(
     keyword: string,
-    options: { automatic?: boolean; authorizationProbe?: boolean; valid?: () => boolean } = {}
+    options: {
+      automatic?: boolean
+      authorizationProbe?: boolean
+      valid?: () => boolean
+      interactive?: boolean
+      profileUserId?: string | null
+      candidateSearchId?: number
+    } = {}
   ): Promise<Candidate[]> {
+    const candidateSearchId = options.interactive
+      ? ++this.candidateSearchId
+      : (options.candidateSearchId ??
+        (options.authorizationProbe ? this.pendingCandidateSearch?.id : undefined))
+    if (options.interactive) {
+      const id = candidateSearchId!
+      this.pendingCandidateSearch = { id, keyword, userId: options.profileUserId }
+      this.candidateSearch = { id, candidates: null }
+      this.changed()
+    }
     const blockVersion = this.blockVersion
     const validate = (): void => {
       if (this.abort.signal.aborted) throw new SkippedQuery('应用正在退出')
-      if (options.authorizationProbe && this.browser.snapshot().queryReady)
+      if (
+        options.authorizationProbe &&
+        this.browser.snapshot().queryReady &&
+        (candidateSearchId === undefined || this.pendingCandidateSearch?.id !== candidateSearchId)
+      )
         throw new SkippedQuery('当前会话已验证，取消重复查询')
       if (options.valid && !options.valid()) throw new SkippedQuery('目标已移除或已更新')
       if (options.automatic && !this.canQueryAutomatically())
@@ -216,7 +254,15 @@ export class RecorderService {
           if (candidate.userId) this.candidates.set(candidate.userId, candidate)
         while (this.candidates.size > 100)
           this.candidates.delete(this.candidates.keys().next().value!)
-        return result
+        const pending = this.pendingCandidateSearch
+        if (pending && pending.id === candidateSearchId && pending.keyword === keyword) {
+          this.candidateSearch = {
+            id: pending.id,
+            candidates: matchingCandidates(result, pending.userId)
+          }
+          this.pendingCandidateSearch = null
+        }
+        return matchingCandidates(result, options.profileUserId)
       } catch (error) {
         if (options.valid && !options.valid()) throw new SkippedQuery('目标已移除或已更新')
         if (error instanceof BrowserQueryError && error.kind === 'SESSION_CHANGED')
@@ -244,11 +290,17 @@ export class RecorderService {
     this.queue = job.catch(() => undefined)
     return job
   }
-  async retryQuery(targetId?: string): Promise<void> {
+  async retryQuery(targetId?: string): Promise<Candidate[] | void> {
     if (targetId) {
       await this.check(targetId)
       return
     }
+    const pending = this.pendingCandidateSearch
+    if (pending)
+      return matchingCandidates(
+        await this.search(pending.keyword, { candidateSearchId: pending.id }),
+        pending.userId
+      )
     const target =
       this.store.targets().find((t) => t.enabled && t.errorKind) ??
       this.store.targets().find((t) => t.enabled)
@@ -257,15 +309,13 @@ export class RecorderService {
       return
     }
     if (this.lastKeyword) {
-      await this.search(this.lastKeyword)
-      return
+      return this.search(this.lastKeyword, { interactive: true })
     }
     throw new Error('请先输入小红书号或选择一个主播进行查询')
   }
   async profile(): Promise<Candidate[]> {
     const profile = await this.browser.currentProfile()
-    const candidates = await this.search(profile.keyWord)
-    return candidates.filter((candidate) => candidate.userId === profile.userId)
+    return this.search(profile.keyWord, { interactive: true, profileUserId: profile.userId })
   }
   add(userId: string): Target {
     const candidate = this.candidates.get(userId)

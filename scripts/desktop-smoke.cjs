@@ -12,11 +12,14 @@ const deadline = setTimeout(() => {
 }, 90000);
 app.setPath("userData", mkdtempSync(path.join(tmpdir(), "xhs-desktop-smoke-")));
 process.env.XHS_START_PAUSED = "1";
+// Preserve the production minimum gap without randomizing the test duration.
+Math.random = () => 0;
 delete process.env.ELECTRON_RENDERER_URL;
 BrowserWindow.prototype.show = () => {};
 let status = 200,
   requests = 0,
   navigations = 0;
+const queriedKeywords = [];
 const payload = {
   success: true,
   data: {
@@ -39,8 +42,10 @@ app.on("ready", () => {
       abort() {},
       end(body) {
         requests++;
+        const keyword = JSON.parse(body).keyword;
+        queriedKeywords.push(keyword);
         assert.equal(options.credentials, "include");
-        assert.equal(JSON.parse(body).keyword, "smoke-account");
+        assert.ok(["smoke-account", "smoke-new-account"].includes(keyword));
         setTimeout(() => {
           const response = Object.assign(new EventEmitter(), {
             statusCode: status,
@@ -52,8 +57,30 @@ app.on("ready", () => {
             Buffer.from(
               JSON.stringify(
                 status === 200
-                  ? payload
-                  : { success: false, msg: "Access restricted" },
+                  ? keyword === "smoke-account"
+                    ? payload
+                    : {
+                        success: true,
+                        data: {
+                          onebox_list: [
+                            {
+                              user_one_box: {
+                                id: "smoke-new-user",
+                                red_id: keyword,
+                                title: "重试恢复的新主播",
+                                live_info: { status: 0 },
+                              },
+                            },
+                          ],
+                        },
+                      }
+                  : {
+                      success: false,
+                      msg:
+                        status === 461
+                          ? "Access restricted"
+                          : "Service unavailable",
+                    },
               ),
             ),
           );
@@ -124,12 +151,55 @@ app
     });
     const win = BrowserWindow.getAllWindows()[0],
       contents = win.webContents;
-    const js = (code) => contents.executeJavaScript(code);
+    const js = (code) =>
+      contents.executeJavaScript(code).catch((error) => {
+        return contents
+          .executeJavaScript("document.body.innerHTML.slice(0, 1800)")
+          .then((html) => {
+            throw new Error(`Renderer check failed: ${code}\nDOM: ${html}`, {
+              cause: error,
+            });
+          });
+      });
     const state = async () => (await js("window.recorder.snapshot()")).value;
     const click = (text) =>
       js(
         `Array.from(document.querySelectorAll('button')).find(b=>b.textContent.trim()===${JSON.stringify(text)}).click()`,
       );
+    const checkCandidateRecovery = async () => {
+      await click("◉监听列表");
+      await until(() =>
+        js("Boolean(document.querySelector('.search-form input'))"),
+      );
+      status = 503;
+      await js(`(() => {
+        const input = document.querySelector('.search-form input');
+        input.value = 'smoke-new-account';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      })()`);
+      await click("查找主播");
+      await until(() =>
+        js(
+          "Boolean(document.querySelector('.query-issue')) && !document.querySelector('.search-form button').disabled",
+        ),
+      );
+      status = 200;
+      const before = queriedKeywords.length;
+      await js(
+        "Array.from(document.querySelectorAll('.query-issue button')).find(b => b.textContent.trim() === '重试').click()",
+      );
+      await until(() => queriedKeywords.length > before);
+      assert.equal(
+        queriedKeywords.at(-1),
+        "smoke-new-account",
+        "Recovery must retry the new search, not an existing target",
+      );
+      await until(() =>
+        js(
+          "Boolean(document.querySelector('.candidate-list')?.textContent.includes('重试恢复的新主播')) && !document.querySelector('.candidate-list button').disabled",
+        ),
+      );
+    };
     const artifacts = path.join(root, "data/dev/query-session");
     mkdirSync(artifacts, { recursive: true });
     const capture = async (name) =>
@@ -162,6 +232,7 @@ app
       js("!document.querySelector('.target-card .query-issue')"),
     );
     assert.equal((await state()).targets[0].error, null);
+    await checkCandidateRecovery();
     const oldNavigations = navigations;
     await click("▣内嵌浏览器");
     await until(() =>
@@ -212,17 +283,11 @@ app
     assert.equal(view.getBounds().height, win.getContentSize()[1] - 34);
     win.minimize();
     await wait(150);
-    assert.equal(
-      (await js("window.recorder.search('smoke-account')")).ok,
-      true,
-    );
+    assert.equal((await js(`window.recorder.check('${target.id}')`)).ok, true);
     win.restore();
     win.hide();
     await wait(150);
-    assert.equal(
-      (await js("window.recorder.search('smoke-account')")).ok,
-      true,
-    );
+    assert.equal((await js(`window.recorder.check('${target.id}')`)).ok, true);
     win.showInactive();
     await wait(150);
     await click("恢复界面");
@@ -241,6 +306,7 @@ app
     );
     await js("document.querySelector('.remove-dialog .primary').click()");
     await until(async () => (await state()).targets.length === 0);
+    await checkCandidateRecovery();
     assert.equal((await js("window.recorder.removeTarget({})")).ok, false);
     const foreign = new BrowserWindow({
       show: false,
@@ -265,6 +331,7 @@ app
         checks: [
           "structured IPC",
           "restriction recovery",
+          "candidate recovery with and without existing targets",
           "diagnostic copy",
           "focus native bounds",
           "video fullscreen Escape",

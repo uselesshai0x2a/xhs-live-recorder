@@ -20,10 +20,11 @@ export interface AppSnapshot {
   queryBlockKind: QueryBlockKind | null
   queryError: QueryIssue | null
   pendingConfirmations: string[]
+  candidateSearch: { id: number; candidates: Candidate[] | null } | null
   browser: BrowserSnapshot
 }
 export interface AppApi {
-  recoverQuery(action: QueryRecoveryAction, targetId?: string): Promise<void>
+  recoverQuery(action: QueryRecoveryAction, targetId?: string): Promise<Candidate[] | void>
   copyDiagnostic(id: string): Promise<void>
   snapshot(): Promise<AppSnapshot>
   search(keyword: string): Promise<Candidate[]>

@@ -227,6 +227,21 @@ describe('recording coordination', () => {
     expect(f.notify).toHaveBeenCalledOnce()
     expect(f.store.notices()).toHaveLength(1)
   })
+  it('keeps normal startup checks for enabled targets without a login change', async () => {
+    const f = setup()
+    vi.useFakeTimers()
+    try {
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(f.browser.search).toHaveBeenCalledExactlyOnceWith('alice')
+      expect(f.start).toHaveBeenCalledOnce()
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
   it('ignores a response after removal and re-addition of the same account', async () => {
     const f = setup()
     let finish!: (value: Candidate[]) => void
@@ -637,6 +652,170 @@ describe('recording coordination', () => {
       expect(f.browser.search).toHaveBeenCalledOnce()
     } finally {
       const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it.each([true, false])(
+    'retries the failed candidate search and returns its results (existing target=%s)',
+    async (existingTarget) => {
+      const f = setup()
+      f.service.setPaused(true)
+      if (!existingTarget) f.store.remove(f.target.id)
+      const result = { ...candidate, keyWord: 'bob', userId: 'user-2', name: 'Bob' }
+      vi.mocked(f.browser.search)
+        .mockRejectedValueOnce(new BrowserQueryError('offline', 'NETWORK'))
+        .mockResolvedValue([result])
+      await expect(f.service.search('bob', { interactive: true })).rejects.toThrow('offline')
+      vi.useFakeTimers()
+      try {
+        const retry = f.service.retryQuery()
+        await vi.advanceTimersByTimeAsync(5000)
+        await expect(retry).resolves.toEqual([result])
+        expect(f.browser.search).toHaveBeenLastCalledWith('bob')
+        expect(f.service.snapshot().candidateSearch?.candidates).toEqual([result])
+        expect(f.start).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+  it('retries the original profile identity even after the viewing page changes', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    const result = { ...candidate, keyWord: 'bob', userId: 'user-2', name: 'Bob' }
+    const currentProfile = vi.fn(async () => ({ keyWord: 'bob', userId: 'user-2', name: 'Bob' }))
+    Object.assign(f.browser, { currentProfile })
+    vi.mocked(f.browser.search)
+      .mockRejectedValueOnce(new BrowserQueryError('signer unavailable', 'SIGNER'))
+      .mockResolvedValue([candidate, result])
+    await expect(f.service.profile()).rejects.toThrow('signer unavailable')
+    currentProfile.mockResolvedValue({ keyWord: 'carol', userId: 'user-3', name: 'Carol' })
+    vi.useFakeTimers()
+    try {
+      const retry = f.service.retryQuery()
+      await vi.advanceTimersByTimeAsync(5000)
+      await expect(retry).resolves.toEqual([result])
+      expect(currentProfile).toHaveBeenCalledOnce()
+      expect(f.browser.search).toHaveBeenLastCalledWith('bob')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+  it('does not let a target check replace a pending candidate search', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    const result = { ...candidate, keyWord: 'bob', userId: 'user-2', name: 'Bob' }
+    vi.mocked(f.browser.search)
+      .mockRejectedValueOnce(new BrowserQueryError('offline', 'NETWORK'))
+      .mockResolvedValueOnce([candidate])
+      .mockResolvedValue([result])
+    await expect(f.service.search('bob', { interactive: true })).rejects.toThrow()
+    vi.useFakeTimers()
+    try {
+      const targetRetry = f.service.retryQuery(f.target.id)
+      await vi.advanceTimersByTimeAsync(5000)
+      await expect(targetRetry).resolves.toBeUndefined()
+      const retry = f.service.retryQuery()
+      await vi.advanceTimersByTimeAsync(5000)
+      await expect(retry).resolves.toEqual([result])
+      expect(f.browser.search).toHaveBeenLastCalledWith('bob')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+  it('publishes recovered candidate results after a real login change without recording', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    const result = { ...candidate, keyWord: 'bob', userId: 'user-2', name: 'Bob' }
+    vi.mocked(f.browser.search)
+      .mockRejectedValueOnce(new BrowserQueryError('please log in', 'AUTH'))
+      .mockResolvedValue([result])
+    await expect(f.service.search('bob', { interactive: true })).rejects.toThrow()
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({
+      authVersion: 1,
+      queryReady: false
+    } as ReturnType<XhsBrowserService['snapshot']>)
+    vi.useFakeTimers()
+    try {
+      f.service.start()
+      await vi.advanceTimersByTimeAsync(12000)
+      expect(f.browser.search).toHaveBeenLastCalledWith('bob')
+      expect(f.service.snapshot().candidateSearch?.candidates).toEqual([result])
+      expect(f.start).not.toHaveBeenCalled()
+    } finally {
+      const closing = f.service.close()
+      await vi.advanceTimersByTimeAsync(2000)
+      await closing
+      vi.useRealTimers()
+    }
+  })
+  it('does not let an older same-keyword check consume a queued profile search', async () => {
+    const f = setup()
+    f.service.setPaused(true)
+    const result = { ...candidate, userId: 'user-2', name: 'Same-keyword profile' }
+    let finish!: (value: Candidate[]) => void
+    vi.mocked(f.browser.search)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finish = resolve
+        })
+      )
+      .mockRejectedValueOnce(new BrowserQueryError('signer unavailable', 'SIGNER'))
+      .mockResolvedValue([candidate, result])
+    const checking = f.service.check(f.target.id)
+    await vi.waitFor(() => expect(f.browser.search).toHaveBeenCalledOnce())
+    const searching = f.service
+      .search('alice', { interactive: true, profileUserId: 'user-2' })
+      .catch((error) => error)
+    vi.useFakeTimers()
+    try {
+      finish([candidate, result])
+      await checking
+      const pendingAfterBackground = f.service.snapshot().candidateSearch?.candidates
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(await searching).toMatchObject({ kind: 'SIGNER' })
+      const retry = f.service.retryQuery().catch((error) => ({ error }))
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(await retry).toEqual([result])
+      expect(pendingAfterBackground).toBeNull()
+      expect(f.service.snapshot().candidateSearch?.candidates).toEqual([result])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+  it('recovers the first pending search after login changes during a persisted cooldown', async () => {
+    const f = setup()
+    f.store.remove(f.target.id)
+    const retryAt = new Date(Date.now() + 60000).toISOString()
+    f.store.account(
+      'RATE_LIMITED',
+      new BrowserQueryError('cooldown', 'RATE_LIMITED', { retryAt }).issue
+    )
+    const restored = new RecorderService(f.store, f.browser, 'unused', vi.fn(), vi.fn(), () => 0)
+    restored.setPaused(true)
+    const recording = vi.spyOn(restored.engine, 'start')
+    const result = { ...candidate, keyWord: 'bob', userId: 'user-2', name: 'Bob' }
+    vi.mocked(f.browser.search).mockResolvedValue([result])
+    await expect(restored.search('bob', { interactive: true })).rejects.toMatchObject({
+      kind: 'RATE_LIMITED'
+    })
+    vi.spyOn(f.browser, 'snapshot').mockReturnValue({
+      authVersion: 1,
+      queryReady: false
+    } as ReturnType<XhsBrowserService['snapshot']>)
+    vi.useFakeTimers()
+    try {
+      restored.start()
+      await vi.advanceTimersByTimeAsync(59000)
+      expect(f.browser.search).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(f.browser.search).toHaveBeenCalledExactlyOnceWith('bob')
+      expect(restored.snapshot().candidateSearch?.candidates).toEqual([result])
+      expect(recording).not.toHaveBeenCalled()
+    } finally {
+      const closing = restored.close()
       await vi.advanceTimersByTimeAsync(2000)
       await closing
       vi.useRealTimers()
